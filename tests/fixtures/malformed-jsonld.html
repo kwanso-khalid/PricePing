@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<title>Malformed JSON-LD Test</title>
+<script type="application/ld+json">
+{ this is not valid json at all!! }
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Product",
+  "name": "Fallback Product"
+}
+</script>
+<meta property="og:price:amount" content="34.99" />
+<meta property="og:price:currency" content="USD" />
+</head>
+<body>
+<h1>Fallback Product</h1>
+<p>Price: $34.99</p>
+</body>
+</html>

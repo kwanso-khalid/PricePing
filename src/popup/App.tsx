@@ -63,12 +63,29 @@ export default function App() {
     setView('save');
 
     try {
-      const results = await chrome.scripting.executeScript({
+      // Phase 1: inject the content script bundle. It runs the extraction and
+      // stores the result in window.__pricewatch_result__ (isolated world).
+      // We cannot read the return value directly because the IIFE wrapper
+      // makes executeScript({ files }) always return undefined.
+      await chrome.scripting.executeScript({
         target: { tabId: pageInfo.tabId },
         files: ['src/content/index.js'],
       });
 
-      const result = results[0]?.result as { success: boolean; product: ExtractedProduct | null } | undefined;
+      // Phase 2: retrieve the stored result via a trivial injected function.
+      // Both calls share the same isolated world for this tab, so the global is readable.
+      const retrieval = await chrome.scripting.executeScript({
+        target: { tabId: pageInfo.tabId },
+        func: () =>
+          (window as unknown as Record<string, unknown>)[
+            '__pricewatch_result__'
+          ] as { success: boolean; product: unknown } | undefined,
+      });
+
+      const result = retrieval[0]?.result as
+        | { success: boolean; product: ExtractedProduct | null }
+        | undefined;
+
       if (result?.success && result.product) {
         setDetectedProduct(result.product);
       } else {

@@ -26,5 +26,9 @@ function runExtraction(): unknown {
   return { success: true, product: result };
 }
 
-// Run and return result (for executeScript's return value)
-runExtraction();
+// Store result in the extension's isolated-world window so the popup
+// can retrieve it with a second executeScript({ func }) call.
+// We cannot rely on executeScript({ files }) returning the value because
+// Rollup's IIFE wrapper makes the script's completion value undefined.
+(window as unknown as Record<string, unknown>)['__pricewatch_result__'] =
+  runExtraction();

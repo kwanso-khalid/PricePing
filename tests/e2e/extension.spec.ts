@@ -6,7 +6,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const extensionPath = path.resolve(__dirname, '../../dist');
 
-test.describe('PriceWatch Extension', () => {
+test.describe('PricePing Extension', () => {
   test('extension loads and popup has correct title', async () => {
     const context = await chromium.launchPersistentContext('', {
       headless: false,
@@ -39,7 +39,7 @@ test.describe('PriceWatch Extension', () => {
 
     // Check the title element exists
     const title = popupPage.locator('h1');
-    await expect(title).toContainText('PriceWatch');
+    await expect(title).toContainText('PricePing');
 
     await context.close();
   });
@@ -98,7 +98,7 @@ test.describe('PriceWatch Extension', () => {
     await optionsPage.waitForSelector('h1', { timeout: 10000 });
 
     const title = optionsPage.locator('h1');
-    await expect(title).toContainText('PriceWatch Options');
+    await expect(title).toContainText('PricePing Options');
 
     // Check settings sections exist
     await expect(optionsPage.locator('text=Check Frequency')).toBeVisible({ timeout: 5000 });

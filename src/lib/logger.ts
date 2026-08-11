@@ -26,7 +26,7 @@ function shouldLog(level: LogLevel): boolean {
 function formatEntry(entry: LogEntry): string {
   const time = new Date(entry.timestamp).toISOString();
   const data = entry.data !== undefined ? ` ${JSON.stringify(entry.data)}` : '';
-  return `[PriceWatch:${entry.context}] ${time} ${entry.level.toUpperCase()}: ${entry.message}${data}`;
+  return `[PricePing:${entry.context}] ${time} ${entry.level.toUpperCase()}: ${entry.message}${data}`;
 }
 
 function createLogger(context: string) {

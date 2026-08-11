@@ -1,6 +1,8 @@
 import type { ExtractedProduct } from '../../types/index.js';
 import { parsePrice } from '../../lib/money.js';
 import { createLogger } from '../../lib/logger.js';
+import { parseStockState, stockStateToInStock } from './stockstate.js';
+import { extractListPrice } from './listprice.js';
 
 const logger = createLogger('extract:opengraph');
 
@@ -48,10 +50,28 @@ export function extractFromOpenGraph(document: Document): ExtractedProduct | nul
   const imageUrl = getMeta(document, 'og:image', 'og:image:url');
 
   const availabilityStr = getMeta(document, 'og:availability', 'product:availability') ?? '';
-  const inStock =
-    !availabilityStr ||
-    availabilityStr.toLowerCase().includes('in stock') ||
-    availabilityStr.toLowerCase().includes('instock');
+  const stockState = parseStockState(availabilityStr);
+  const inStock = stockStateToInStock(stockState);
+
+  // Advertised list price: check og:price:standard_amount / product:original_price:amount
+  let advertisedListPrice = null;
+  const listPriceStr = getMeta(
+    document,
+    'og:price:standard_amount',
+    'product:original_price:amount',
+    'product:price:old_amount',
+  );
+  if (listPriceStr) {
+    const listResult = parsePrice(listPriceStr, result.value.currency);
+    if (listResult.ok && listResult.value.amountMinor > result.value.amountMinor) {
+      advertisedListPrice = listResult.value;
+    }
+  }
+
+  // DOM fallback
+  if (!advertisedListPrice) {
+    advertisedListPrice = extractListPrice(document, result.value.amountMinor, result.value.currency);
+  }
 
   return {
     title: title.trim(),
@@ -59,7 +79,9 @@ export function extractFromOpenGraph(document: Document): ExtractedProduct | nul
     imageUrl,
     currency: result.value.currency,
     inStock,
+    advertisedListPrice,
     confidence: 0.75,
     method: 'opengraph',
+    stockState,
   };
 }

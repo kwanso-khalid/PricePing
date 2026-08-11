@@ -1,4 +1,4 @@
-# PriceWatch
+# PricePing
 
 Local-only Chrome extension (MV3). Nothing leaves the browser. No backend, no
 accounts, no AI, no third-party services.

@@ -221,3 +221,52 @@ export function priceDifferencePercent(from: Money, to: Money): number {
 export function moneyFromMinor(amountMinor: number, currency: CurrencyCode): Money {
   return { amountMinor, currency };
 }
+
+const NULL_PRICE_PATTERNS = [
+  /^free$/i,
+  /see price in cart/i,
+  /sign in/i,
+  /log in/i,
+  /login/i,
+  /unavailable/i,
+];
+
+const EXTRA_CURRENCY_ABBR: Array<[RegExp, string]> = [
+  [/(^zł?\s*|\s*zł?$)/i, 'PLN'],
+  [/(^kr\s*|\s*kr$)/i, 'SEK'],
+  [/(^ft\s*|\s*ft$)/i, 'HUF'],
+  [/(^lei\s*|\s*lei$)/i, 'RON'],
+  [/(^kč?\s*|\s*kč?$)/i, 'CZK'],
+];
+
+/**
+ * Normalize any unknown input to Money or null.
+ * Returns null for non-strings, "Free", cart/login strings, price ranges take the lower end.
+ */
+export function normalizeMoney(input: unknown, defaultCurrency: CurrencyCode = 'USD'): Money | null {
+  if (typeof input !== 'string') return null;
+  const s = input.trim();
+  if (!s) return null;
+  for (const pat of NULL_PRICE_PATTERNS) {
+    if (pat.test(s)) return null;
+  }
+
+  // Price range: take the lower (first) value
+  const rangeMatch = /^(.+?)\s*[-–—]\s*(.+)$/.exec(s);
+  const candidate = rangeMatch ? (rangeMatch[1] ?? s) : s;
+
+  // Detect extra currency abbreviations not handled by parsePrice
+  let currency = defaultCurrency;
+  let priceStr = candidate;
+  for (const [re, code] of EXTRA_CURRENCY_ABBR) {
+    if (re.test(candidate.trim())) {
+      currency = code;
+      priceStr = candidate.replace(re, '').trim();
+      break;
+    }
+  }
+
+  const result = parsePrice(priceStr, currency);
+  if (!result.ok) return null;
+  return result.value;
+}

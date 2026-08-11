@@ -1,85 +1,66 @@
 import { describe, it, expect } from 'vitest';
-import { addPricePoint, downsampleHistory } from '../../src/lib/history.js';
-import type { PricePoint } from '../../src/types/index.js';
+import { computeStats, sparklinePoints } from '../../src/lib/stats.js';
+import type { Observation } from '../../src/types/storage.js';
 
-function makePoint(amountMinor: number, daysAgo: number): PricePoint {
-  return {
-    price: { amountMinor, currency: 'USD' },
-    observedAt: Date.now() - daysAgo * 24 * 60 * 60 * 1000,
-    inStock: true,
-  };
+function obs(minutesSinceEpoch: number, price: number, tier: 1 | 2 | 3 | 4 = 1): Observation {
+  return [minutesSinceEpoch, price, 0, 1, tier];
 }
 
-describe('addPricePoint', () => {
-  it('adds a point to history', () => {
-    const history: PricePoint[] = [];
-    const point = makePoint(1000, 0);
-    const result = addPricePoint(history, point);
-    expect(result).toHaveLength(1);
-    expect(result[0]).toEqual(point);
+describe('computeStats', () => {
+  it('returns zeros for empty observations', () => {
+    const stats = computeStats([], null, null);
+    expect(stats.observationCount).toBe(0);
+    expect(stats.allTimeMin).toBeNull();
+    expect(stats.allTimeMax).toBeNull();
   });
 
-  it('preserves existing points', () => {
-    const history = [makePoint(1000, 5), makePoint(900, 2)];
-    const newPoint = makePoint(800, 0);
-    const result = addPricePoint(history, newPoint);
-    expect(result).toHaveLength(3);
-    expect(result[2]).toEqual(newPoint);
+  it('computes all-time min and max', () => {
+    const observations: Observation[] = [obs(100, 2000), obs(200, 1500), obs(300, 1800)];
+    const stats = computeStats(observations, null, null);
+    expect(stats.allTimeMin?.priceMinor).toBe(1500);
+    expect(stats.allTimeMax?.priceMinor).toBe(2000);
+  });
+
+  it('preserves prev all-time min from trimmed history', () => {
+    const observations: Observation[] = [obs(100, 2000), obs(200, 1800)];
+    const prevMin = { priceMinor: 1000, observedAt: 1 };
+    const stats = computeStats(observations, prevMin, null);
+    expect(stats.allTimeMin?.priceMinor).toBe(1000);
+  });
+
+  it('counts changes correctly', () => {
+    const observations: Observation[] = [obs(100, 1000), obs(200, 900), obs(300, 900), obs(400, 800)];
+    const stats = computeStats(observations, null, null);
+    expect(stats.changeCount).toBe(2); // 1000→900, 900→800
+  });
+
+  it('computes window stats', () => {
+    const nowMs = Date.now();
+    const nowMinutes = Math.floor(nowMs / 60_000);
+    const observations: Observation[] = [
+      obs(nowMinutes - 10, 1000),
+      obs(nowMinutes - 5, 800),
+      obs(nowMinutes - 1, 900),
+    ];
+    const stats = computeStats(observations, null, null, nowMs);
+    expect(stats.w30).not.toBeNull();
+    expect(stats.w30?.min).toBe(800);
+    expect(stats.w30?.max).toBe(1000);
+    expect(stats.w30?.count).toBe(3);
   });
 });
 
-describe('downsampleHistory', () => {
-  it('does not modify history under limit', () => {
-    const history = Array.from({ length: 100 }, (_, i) => makePoint(1000 + i, i));
-    const result = downsampleHistory(history);
-    expect(result).toHaveLength(100);
+describe('sparklinePoints', () => {
+  it('returns last 20 price values', () => {
+    const observations: Observation[] = Array.from({ length: 25 }, (_, i) => obs(i, 1000 + i));
+    const points = sparklinePoints(observations);
+    expect(points).toHaveLength(20);
+    expect(points[0]).toBe(1005); // obs at index 5 (last 20 of 25)
+    expect(points[19]).toBe(1024);
   });
 
-  it('caps history at 200 points', () => {
-    // All recent points (within 90 days) - downsampling won't help old ones
-    const history = Array.from({ length: 250 }, (_, i) => makePoint(1000 + i, i));
-    const result = downsampleHistory(history);
-    expect(result.length).toBeLessThanOrEqual(200);
-  });
-
-  it('downsamples old points to 1 per day', () => {
-    // Create 250 points: 200 all from 100+ days ago (5 distinct days) + 50 recent
-    // This forces downsampling of old entries to be exercised
-    const oldPoints = Array.from({ length: 200 }, (_, i) =>
-      makePoint(1000 + i, 100 + (i % 5)), // 5 different old days
-    );
-    const recentPoints = Array.from({ length: 50 }, (_, i) =>
-      makePoint(2000 + i, i),
-    );
-    const combined = [...oldPoints, ...recentPoints];
-    const result = downsampleHistory(combined);
-    // Old entries should be downsampled to 5 (one per day), recent kept = 55 total
-    const oldInResult = result.filter(
-      (p) => p.observedAt < Date.now() - 90 * 24 * 60 * 60 * 1000,
-    );
-    expect(oldInResult.length).toBeLessThanOrEqual(5);
-    expect(result.length).toBeLessThanOrEqual(200);
-  });
-
-  it('keeps all recent points and downsamples old ones', () => {
-    const recentPoints = Array.from({ length: 50 }, (_, i) => makePoint(1000 + i, i));
-    const oldPoints = Array.from({ length: 200 }, (_, i) =>
-      makePoint(2000 + i, 91 + (i % 10)),
-    ); // 10 different old days
-
-    const history = [...oldPoints, ...recentPoints];
-    const result = downsampleHistory(history);
-
-    // Recent points should all be kept
-    const recentInResult = result.filter(
-      (p) => p.observedAt >= Date.now() - 90 * 24 * 60 * 60 * 1000,
-    );
-    expect(recentInResult.length).toBe(50);
-
-    // Old points should be downsampled to ~10 (one per day)
-    const oldInResult = result.filter(
-      (p) => p.observedAt < Date.now() - 90 * 24 * 60 * 60 * 1000,
-    );
-    expect(oldInResult.length).toBeLessThanOrEqual(10);
+  it('returns all points if fewer than 20', () => {
+    const observations: Observation[] = [obs(1, 500), obs(2, 600)];
+    expect(sparklinePoints(observations)).toEqual([500, 600]);
   });
 });

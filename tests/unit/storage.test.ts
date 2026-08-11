@@ -1,102 +1,96 @@
-import { describe, it, expect } from 'vitest';
-import {
-  getAllItems,
-  saveItem,
-  deleteItem,
-  getSettings,
-  saveSettings,
-} from '../../src/lib/storage.js';
-import type { TrackedItem, AppSettings } from '../../src/types/index.js';
+import { describe, it, expect, vi } from 'vitest';
+import { getProductIndex, addProduct, removeProduct, getProduct, getHistory, appendObservation, updateProduct, getSettings, saveSettings, runMigration, SCHEMA_VERSION } from '../../src/lib/storage.js';
+import type { Product, Observation, Settings } from '../../src/types/storage.js';
 
-// Access the mock chrome object set up in setup.ts
 type ChromeMock = {
-  storage: {
-    local: {
-      get: ReturnType<typeof import('vitest').vi.fn>;
-      set: ReturnType<typeof import('vitest').vi.fn>;
-      remove: ReturnType<typeof import('vitest').vi.fn>;
-    };
-  };
-  runtime: {
-    lastError: { message?: string } | null;
-  };
+  storage: { local: { get: ReturnType<typeof vi.fn>; set: ReturnType<typeof vi.fn>; remove: ReturnType<typeof vi.fn>; clear: ReturnType<typeof vi.fn>; getBytesInUse: ReturnType<typeof vi.fn> } };
+  runtime: { lastError: { message?: string } | null };
 };
+function getChrome(): ChromeMock { return (globalThis as unknown as { chrome: ChromeMock }).chrome; }
 
-function getChromeMock(): ChromeMock {
-  return (globalThis as unknown as { chrome: ChromeMock }).chrome;
+function makeProduct(overrides: Partial<Product> = {}): Product {
+  return {
+    id: 'p1', retailerHost: 'example.com', url: 'https://example.com/p/1',
+    canonicalKey: 'abc123', title: 'Test', imageUrl: null, variantLabel: null,
+    currency: 'USD', initialPriceMinor: 1999, currentPrice: 1999,
+    advertisedListPrice: null, stockState: 1, lastKnownStockState: 1, parseStatus: 'ok', parseTier: 1,
+    consecutiveFailures: 0, lastCheckedAt: null, lastSuccessfulParseAt: null,
+    createdAt: 1000, notes: '',
+    watch: { targetPrice: null, cooldownHours: 24, muted: false, lastAlertedPrice: null, lastAlertedAt: null, notifyOnRestock: false, dropThresholdPct: null },
+    stats: { observationCount: 0, changeCount: 0, daysTracked: 0, lastChangeAt: null, allTimeMin: null, allTimeMax: null, w30: null, w90: null, w365: null },
+    ...overrides,
+  };
 }
 
-const sampleItem: TrackedItem = {
-  id: 'test-id-1',
-  url: 'https://example.com/product/1',
-  title: 'Test Product',
-  imageUrl: null,
-  hostname: 'example.com',
-  currency: 'USD',
-  initialPrice: { amountMinor: 1999, currency: 'USD' },
-  currentPrice: { amountMinor: 1999, currency: 'USD' },
-  targetPrice: null,
-  history: [],
-  createdAt: 1000,
-  lastCheckedAt: null,
-  lastNotifiedAt: null,
-  lastNotifiedPriceMinor: null,
-  consecutiveFailures: 0,
-  paused: false,
-  extractionMethod: 'jsonld',
-};
+const firstObs: Observation = [Math.floor(1000 / 60_000), 1999, 0, 1, 1];
 
 describe('storage', () => {
-  it('returns empty items when storage is empty', async () => {
-    const items = await getAllItems();
-    expect(items).toEqual({});
+  it('returns empty index when no data', async () => {
+    expect(await getProductIndex()).toEqual([]);
   });
 
-  it('saves and retrieves an item', async () => {
+  it('adds a product and retrieves it', async () => {
     const stored: Record<string, unknown> = {};
-    const chromeMock = getChromeMock();
+    const c = getChrome();
+    c.storage.local.set.mockImplementation((data: Record<string, unknown>, cb: () => void) => { Object.assign(stored, data); cb(); });
+    c.storage.local.get.mockImplementation((key: string, cb: (r: Record<string, unknown>) => void) => { cb({ [key]: stored[key] }); });
 
-    chromeMock.storage.local.set.mockImplementation(
-      (data: Record<string, unknown>, callback: () => void) => {
-        Object.assign(stored, data);
-        callback();
-      },
-    );
-    chromeMock.storage.local.get.mockImplementation(
-      (_keys: unknown, callback: (result: Record<string, unknown>) => void) => {
-        callback(stored);
-      },
-    );
+    const result = await addProduct(makeProduct(), firstObs);
+    expect(result.ok).toBe(true);
 
-    await saveItem(sampleItem);
-    const items = await getAllItems();
-    expect(items['test-id-1']).toBeDefined();
-    expect(items['test-id-1']?.title).toBe('Test Product');
+    const idx = await getProductIndex();
+    expect(idx).toHaveLength(1);
+    expect(idx[0]?.id).toBe('p1');
   });
 
-  it('deletes an item', async () => {
+  it('enforces 100-product cap', async () => {
+    // Simulate meta with productCount already at 100
+    const c = getChrome();
+    c.storage.local.get.mockImplementation((key: string, cb: (r: Record<string, unknown>) => void) => {
+      if (key === 'meta') cb({ meta: { schemaVersion: 2, productCount: 100, settings: {} } });
+      else cb({});
+    });
+    const result = await addProduct(makeProduct({ id: 'new' }), firstObs);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain('100');
+  });
+
+  it('removes a product', async () => {
     const stored: Record<string, unknown> = {};
-    const chromeMock = getChromeMock();
+    const c = getChrome();
+    c.storage.local.set.mockImplementation((data: Record<string, unknown>, cb: () => void) => { Object.assign(stored, data); cb(); });
+    c.storage.local.get.mockImplementation((key: string, cb: (r: Record<string, unknown>) => void) => { cb({ [key]: stored[key] }); });
+    c.storage.local.remove.mockImplementation((_keys: unknown, cb: () => void) => { cb(); });
 
-    chromeMock.storage.local.set.mockImplementation(
-      (data: Record<string, unknown>, callback: () => void) => {
-        Object.assign(stored, data);
-        callback();
-      },
-    );
-    chromeMock.storage.local.get.mockImplementation(
-      (_keys: unknown, callback: (result: Record<string, unknown>) => void) => {
-        callback(stored);
-      },
-    );
+    await addProduct(makeProduct(), firstObs);
+    const removeResult = await removeProduct('p1');
+    expect(removeResult.ok).toBe(true);
 
-    await saveItem(sampleItem);
-    await deleteItem('test-id-1');
-    const items = await getAllItems();
-    expect(items['test-id-1']).toBeUndefined();
+    const idx = await getProductIndex();
+    expect(idx.find((s) => s.id === 'p1')).toBeUndefined();
   });
 
-  it('returns default settings when none saved', async () => {
+  it('appends observation and updates stats', async () => {
+    const stored: Record<string, unknown> = {};
+    const c = getChrome();
+    c.storage.local.set.mockImplementation((data: Record<string, unknown>, cb: () => void) => { Object.assign(stored, data); cb(); });
+    c.storage.local.get.mockImplementation((key: string, cb: (r: Record<string, unknown>) => void) => { cb({ [key]: stored[key] }); });
+
+    await addProduct(makeProduct(), firstObs);
+    const newObs: Observation = [Math.floor(Date.now() / 60_000), 1799, 0, 1, 1];
+    const result = await appendObservation('p1', newObs);
+    expect(result.ok).toBe(true);
+
+    const history = await getHistory('p1');
+    expect(history?.obs).toHaveLength(2);
+    expect(history?.obs[1]?.[1]).toBe(1799);
+
+    const product = await getProduct('p1');
+    expect(product?.currentPrice).toBe(1799);
+    expect(product?.stats.observationCount).toBe(2);
+  });
+
+  it('returns default settings', async () => {
     const settings = await getSettings();
     expect(settings.checkIntervalHours).toBe(6);
     expect(settings.notificationsEnabled).toBe(true);
@@ -105,102 +99,92 @@ describe('storage', () => {
 
   it('saves and retrieves settings', async () => {
     const stored: Record<string, unknown> = {};
-    const chromeMock = getChromeMock();
+    const c = getChrome();
+    c.storage.local.set.mockImplementation((data: Record<string, unknown>, cb: () => void) => { Object.assign(stored, data); cb(); });
+    c.storage.local.get.mockImplementation((key: string, cb: (r: Record<string, unknown>) => void) => { cb({ [key]: stored[key] }); });
 
-    chromeMock.storage.local.set.mockImplementation(
-      (data: Record<string, unknown>, callback: () => void) => {
-        Object.assign(stored, data);
-        callback();
-      },
-    );
-    chromeMock.storage.local.get.mockImplementation(
-      (_keys: unknown, callback: (result: Record<string, unknown>) => void) => {
-        callback(stored);
-      },
-    );
-
-    const newSettings: AppSettings = {
-      checkIntervalHours: 12,
-      notificationsEnabled: false,
-      mutedUntil: null,
-      perSiteEnabled: {},
-    };
-
+    const newSettings: Settings = { checkIntervalHours: 12, notificationsEnabled: false, mutedUntil: null, quietHours: null };
     await saveSettings(newSettings);
     const retrieved = await getSettings();
     expect(retrieved.checkIntervalHours).toBe(12);
     expect(retrieved.notificationsEnabled).toBe(false);
   });
 
-  it('handles storage write failure gracefully', async () => {
-    const chromeMock = getChromeMock();
-
-    chromeMock.storage.local.set.mockImplementation(
-      (_data: unknown, callback: () => void) => {
-        chromeMock.runtime.lastError = { message: 'QuotaExceededError' };
-        callback();
-        chromeMock.runtime.lastError = null;
-      },
-    );
-
-    const result = await saveItem(sampleItem);
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.error).toContain('Storage write failed');
-    }
-  });
-
-  it('handles corrupt storage data gracefully', async () => {
-    const chromeMock = getChromeMock();
-
-    chromeMock.storage.local.get.mockImplementation(
-      (_keys: unknown, callback: (result: Record<string, unknown>) => void) => {
-        callback({ pricewatch_data: 'not-an-object' });
-      },
-    );
-
-    const items = await getAllItems();
-    expect(items).toEqual({});
-  });
-
-  it('runs migrations from v0 to v1', async () => {
+  it('migrates from v1 to v2', async () => {
     const stored: Record<string, unknown> = {};
-    const chromeMock = getChromeMock();
-
-    chromeMock.storage.local.get.mockImplementation(
-      (_keys: unknown, callback: (result: Record<string, unknown>) => void) => {
-        callback({
-          pricewatch_data: {
-            schemaVersion: 0,
-            items: {
-              'old-item': {
-                id: 'old-item',
-                url: 'https://example.com',
-                title: 'Old Item',
-                // missing consecutiveFailures, paused, etc.
-              },
+    const c = getChrome();
+    c.storage.local.set.mockImplementation((data: Record<string, unknown>, cb: () => void) => { Object.assign(stored, data); cb(); });
+    c.storage.local.get.mockImplementation((key: string, cb: (r: Record<string, unknown>) => void) => {
+      if (key === 'meta') cb({});  // no meta → migration needed
+      else if (key === 'pricewatch_data') cb({
+        pricewatch_data: {
+          schemaVersion: 1,
+          items: {
+            'old-1': {
+              id: 'old-1', url: 'https://example.com/product', title: 'Old Product',
+              imageUrl: null, hostname: 'example.com', currency: 'USD',
+              initialPrice: { amountMinor: 2000, currency: 'USD' },
+              currentPrice: { amountMinor: 1800, currency: 'USD' },
+              targetPrice: null,
+              history: [{ price: { amountMinor: 2000, currency: 'USD' }, observedAt: 1000, inStock: true }],
+              createdAt: 1000, lastCheckedAt: null, lastNotifiedAt: null,
+              lastNotifiedPriceMinor: null, consecutiveFailures: 0, paused: false,
+              extractionMethod: 'jsonld',
             },
-            settings: {},
-            notifications: {},
           },
-        });
-      },
-    );
+          settings: { checkIntervalHours: 6, notificationsEnabled: true, mutedUntil: null },
+        },
+      });
+      else cb({ [key]: stored[key] });
+    });
+    c.storage.local.remove.mockImplementation((_: unknown, cb: () => void) => cb());
 
-    chromeMock.storage.local.set.mockImplementation(
-      (data: Record<string, unknown>, callback: () => void) => {
-        Object.assign(stored, data);
-        callback();
-      },
-    );
+    await runMigration();
 
-    const items = await getAllItems();
-    expect(items['old-item']?.consecutiveFailures).toBe(0);
-    expect(items['old-item']?.paused).toBe(false);
+    // After migration, the product should exist under p:old-1
+    expect(stored['p:old-1']).toBeDefined();
+    expect(stored['h:old-1']).toBeDefined();
+    const p = stored['p:old-1'] as Product;
+    expect(p.title).toBe('Old Product');
+    expect(p.currentPrice).toBe(1800);
+    expect(p.parseStatus).toBe('ok');
+    const meta = stored['meta'] as { schemaVersion: number };
+    expect(meta.schemaVersion).toBe(SCHEMA_VERSION);
   });
 
-  it('deleting non-existent item is a no-op', async () => {
-    const result = await deleteItem('does-not-exist');
-    expect(result.ok).toBe(true);
+  it('skips migration when already at SCHEMA_VERSION', async () => {
+    const c = getChrome();
+    const setCalled = vi.fn();
+    c.storage.local.set.mockImplementation((_: unknown, cb: () => void) => { setCalled(); cb(); });
+    c.storage.local.get.mockImplementation((key: string, cb: (r: Record<string, unknown>) => void) => {
+      if (key === 'meta') cb({ meta: { schemaVersion: SCHEMA_VERSION, productCount: 0, settings: {} } });
+      else cb({});
+    });
+    await runMigration();
+    expect(setCalled).not.toHaveBeenCalled();
+  });
+
+  it('runs v2→v3 migration when on schema v2', async () => {
+    const stored: Record<string, unknown> = {
+      meta: { schemaVersion: 2, productCount: 0, settings: {} },
+      idx: [],
+    };
+    const c = getChrome();
+    c.storage.local.set.mockImplementation((data: Record<string, unknown>, cb: () => void) => { Object.assign(stored, data); cb(); });
+    c.storage.local.get.mockImplementation((key: string, cb: (r: Record<string, unknown>) => void) => { cb({ [key]: stored[key] }); });
+    await runMigration();
+    const meta = stored['meta'] as { schemaVersion: number };
+    expect(meta.schemaVersion).toBe(SCHEMA_VERSION);
+  });
+
+  it('handles storage write failure', async () => {
+    const c = getChrome();
+    c.storage.local.set.mockImplementation((_: unknown, cb: () => void) => {
+      c.runtime.lastError = { message: 'QuotaExceededError' };
+      cb();
+      c.runtime.lastError = null;
+    });
+    const result = await addProduct(makeProduct(), firstObs);
+    expect(result.ok).toBe(false);
   });
 });

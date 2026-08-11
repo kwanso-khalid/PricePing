@@ -1,50 +1,30 @@
 import React from 'react';
-import type { PricePoint } from '../../types/index.js';
 
 interface SparklineChartProps {
-  history: PricePoint[];
+  points: number[];
   width?: number;
   height?: number;
   color?: string;
 }
 
-export function SparklineChart({
-  history,
-  width = 80,
-  height = 32,
-  color = '#3b82f6',
-}: SparklineChartProps) {
-  if (history.length < 2) {
+export function SparklineChart({ points, width = 80, height = 32, color = '#3b82f6' }: SparklineChartProps) {
+  if (points.length < 2) {
     return <div style={{ width, height }} className="flex items-center justify-center text-gray-300 text-xs">—</div>;
   }
-
-  const prices = history.map((p) => p.price.amountMinor);
-  const minPrice = Math.min(...prices);
-  const maxPrice = Math.max(...prices);
-  const range = maxPrice - minPrice || 1;
-
-  const padding = 2;
-  const plotWidth = width - padding * 2;
-  const plotHeight = height - padding * 2;
-
-  const points = prices.map((price, i) => {
-    const x = padding + (i / (prices.length - 1)) * plotWidth;
-    const y = padding + plotHeight - ((price - minPrice) / range) * plotHeight;
+  const minP = Math.min(...points);
+  const maxP = Math.max(...points);
+  const range = maxP - minP || 1;
+  const pad = 2;
+  const pw = width - pad * 2;
+  const ph = height - pad * 2;
+  const pts = points.map((p, i) => {
+    const x = pad + (i / (points.length - 1)) * pw;
+    const y = pad + ph - ((p - minP) / range) * ph;
     return `${x},${y}`;
   });
-
-  const polylinePoints = points.join(' ');
-
   return (
     <svg width={width} height={height} className="overflow-visible" aria-hidden="true">
-      <polyline
-        points={polylinePoints}
-        fill="none"
-        stroke={color}
-        strokeWidth="1.5"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
+      <polyline points={pts.join(' ')} fill="none" stroke={color} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   );
 }

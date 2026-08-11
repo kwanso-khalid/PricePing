@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import type { ExtractedProduct, TrackedItem } from '../types/index.js';
-import { getAllItems, saveItem, deleteItem, getItem } from '../lib/storage.js';
+import type { ProductSummary, Product, Observation, StockStateCode, ParseTier } from '../types/storage.js';
+import type { ExtractedProduct } from '../types/index.js';
+import { getProductIndex, addProduct, removeProduct, getProduct, updateProduct } from '../lib/storage.js';
+import { canonicalKey } from '../lib/canonical.js';
 import { canonicalizeUrl, getHostname } from '../lib/url.js';
 import { priceDifferencePercent } from '../lib/money.js';
 import { STRINGS } from '../lib/strings.js';
@@ -10,15 +12,21 @@ import { v4 as uuidv4 } from 'uuid';
 
 type SortKey = 'recent' | 'drop' | 'name' | 'added';
 type View = 'list' | 'save';
+interface PageInfo { url: string; title: string; tabId: number; }
 
-interface PageInfo {
-  url: string;
-  title: string;
-  tabId: number;
+function methodToTier(method: ExtractedProduct['method']): ParseTier {
+  if (method === 'adapter' || method === 'shopify' || method === 'woocommerce') return 2;
+  if (method === 'generic') return 3;
+  return 1;
 }
 
+const EMPTY_STATS = {
+  observationCount: 0, changeCount: 0, daysTracked: 0, lastChangeAt: null,
+  allTimeMin: null, allTimeMax: null, w30: null, w90: null, w365: null,
+};
+
 export default function App() {
-  const [items, setItems] = useState<TrackedItem[]>([]);
+  const [items, setItems] = useState<ProductSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [sortKey, setSortKey] = useState<SortKey>('recent');
@@ -30,67 +38,41 @@ export default function App() {
 
   const loadItems = useCallback(async () => {
     try {
-      const all = await getAllItems();
-      setItems(Object.values(all));
+      setItems(await getProductIndex());
     } catch {
       setError(STRINGS.storageError);
     } finally {
       setLoading(false);
     }
-  }, [setLoading]);
+  }, []);
 
   useEffect(() => {
     void loadItems();
-
-    // Get current tab info
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       const tab = tabs[0];
       if (tab?.url && tab.id !== undefined) {
-        const canonUrl = canonicalizeUrl(tab.url);
-        setPageInfo({ url: canonUrl, title: tab.title ?? '', tabId: tab.id });
+        setPageInfo({ url: canonicalizeUrl(tab.url), title: tab.title ?? '', tabId: tab.id });
       }
     });
   }, [loadItems]);
 
-  // Check if current page is already tracked
-  const alreadyTracked = Boolean(
-    pageInfo && items.some((i) => i.url === pageInfo.url),
-  );
+  const alreadyTracked = Boolean(pageInfo && items.some((i) => i.url === pageInfo.url));
 
   async function detectProduct() {
     if (!pageInfo) return;
     setDetecting(true);
     setView('save');
-
     try {
-      // Phase 1: inject the content script bundle. It runs the extraction and
-      // stores the result in window.__pricewatch_result__ (isolated world).
-      // We cannot read the return value directly because the IIFE wrapper
-      // makes executeScript({ files }) always return undefined.
-      await chrome.scripting.executeScript({
-        target: { tabId: pageInfo.tabId },
-        files: ['src/content/index.js'],
-      });
-
-      // Phase 2: retrieve the stored result via a trivial injected function.
-      // Both calls share the same isolated world for this tab, so the global is readable.
+      // Always re-inject to get a fresh extraction for the current page.
+      // A guard that skips injection when __priceping_result__ exists causes
+      // stale results to persist on SPAs where the window is never reset between navigations.
+      await chrome.scripting.executeScript({ target: { tabId: pageInfo.tabId }, files: ['src/content/index.js'] });
       const retrieval = await chrome.scripting.executeScript({
         target: { tabId: pageInfo.tabId },
-        func: () =>
-          (window as unknown as Record<string, unknown>)[
-            '__pricewatch_result__'
-          ] as { success: boolean; product: unknown } | undefined,
+        func: () => (window as unknown as Record<string, unknown>)['__priceping_result__'] as { success: boolean; product: unknown } | undefined,
       });
-
-      const result = retrieval[0]?.result as
-        | { success: boolean; product: ExtractedProduct | null }
-        | undefined;
-
-      if (result?.success && result.product) {
-        setDetectedProduct(result.product);
-      } else {
-        setDetectedProduct(null);
-      }
+      const result = retrieval[0]?.result as { success: boolean; product: ExtractedProduct | null } | undefined;
+      setDetectedProduct(result?.success && result.product ? result.product : null);
     } catch {
       setDetectedProduct(null);
     } finally {
@@ -100,184 +82,131 @@ export default function App() {
 
   async function handleSave(targetPriceMinor: number | null) {
     if (!pageInfo || !detectedProduct) return;
-
-    const now = Date.now();
-    const newItem: TrackedItem = {
-      id: uuidv4(),
-      url: pageInfo.url,
-      title: detectedProduct.title,
-      imageUrl: detectedProduct.imageUrl,
-      hostname: getHostname(pageInfo.url),
-      currency: detectedProduct.currency,
-      initialPrice: detectedProduct.price,
-      currentPrice: detectedProduct.price,
-      targetPrice:
-        targetPriceMinor !== null
-          ? { amountMinor: targetPriceMinor, currency: detectedProduct.currency }
-          : null,
-      history: [
-        {
-          price: detectedProduct.price,
-          observedAt: now,
-          inStock: detectedProduct.inStock,
+    try {
+      const now = Date.now();
+      const id = uuidv4();
+      const cKey = await canonicalKey(pageInfo.url);
+      const tier = methodToTier(detectedProduct.method);
+      const stockState: StockStateCode = detectedProduct.inStock ? 1 : 2;
+      const firstObs: Observation = [
+        Math.floor(now / 60_000),
+        detectedProduct.price.amountMinor,
+        detectedProduct.advertisedListPrice?.amountMinor ?? 0,
+        stockState,
+        tier,
+      ];
+      const product: Product = {
+        id, retailerHost: getHostname(pageInfo.url), url: pageInfo.url, canonicalKey: cKey,
+        title: detectedProduct.title, imageUrl: detectedProduct.imageUrl, variantLabel: null,
+        currency: detectedProduct.currency,
+        initialPriceMinor: detectedProduct.price.amountMinor,
+        currentPrice: detectedProduct.price.amountMinor,
+        advertisedListPrice: detectedProduct.advertisedListPrice?.amountMinor ?? null,
+        stockState, lastKnownStockState: stockState,
+        parseStatus: 'ok', parseTier: tier, consecutiveFailures: 0,
+        lastCheckedAt: null, lastSuccessfulParseAt: now, createdAt: now,
+        notes: '',
+        watch: {
+          targetPrice: targetPriceMinor, cooldownHours: 24, muted: false,
+          lastAlertedPrice: null, lastAlertedAt: null,
+          notifyOnRestock: false, dropThresholdPct: null,
         },
-      ],
-      createdAt: now,
-      lastCheckedAt: null,
-      lastNotifiedAt: null,
-      lastNotifiedPriceMinor: null,
-      consecutiveFailures: 0,
-      paused: false,
-      extractionMethod: detectedProduct.method,
-    };
-
-    const result = await saveItem(newItem);
-    if (result.ok) {
-      setSaveStatus(STRINGS.priceSaved);
-      await loadItems();
-      setTimeout(() => {
-        setView('list');
-        setSaveStatus(null);
-      }, 1500);
-    } else {
-      setSaveStatus(STRINGS.saveFailed);
+        stats: { ...EMPTY_STATS },
+      };
+      const result = await addProduct(product, firstObs);
+      if (result.ok) {
+        setSaveStatus(STRINGS.priceSaved);
+        await loadItems();
+        setTimeout(() => { setView('list'); setSaveStatus(null); }, 1500);
+      } else {
+        setSaveStatus(result.error);
+      }
+    } catch (e) {
+      setSaveStatus(e instanceof Error ? e.message : STRINGS.saveFailed);
     }
   }
 
   async function handleManualPrice(priceStr: string) {
-    // For now, create a partial product with manual price
     const { parsePrice } = await import('../lib/money.js');
     const result = parsePrice(priceStr);
     if (result.ok && pageInfo) {
       setDetectedProduct({
-        title: pageInfo.title || 'Product',
-        price: result.value,
-        imageUrl: null,
-        currency: result.value.currency,
-        inStock: true,
-        confidence: 1.0,
-        method: 'manual',
+        title: pageInfo.title || 'Product', price: result.value, imageUrl: null,
+        currency: result.value.currency, advertisedListPrice: null,
+        inStock: true, confidence: 1.0, method: 'manual',
       });
     }
   }
 
   async function handleDelete(id: string) {
-    await deleteItem(id);
+    await removeProduct(id);
     await loadItems();
   }
 
   async function handleTogglePause(id: string) {
-    const item = await getItem(id);
-    if (!item) return;
-    const updated = { ...item, paused: !item.paused };
-    await saveItem(updated);
+    const product = await getProduct(id);
+    if (!product) return;
+    await updateProduct({ ...product, parseStatus: product.parseStatus !== 'ok' ? 'ok' : 'paused' });
     await loadItems();
   }
 
   async function handleSetTargetPrice(id: string, priceMinor: number | null) {
-    const item = await getItem(id);
-    if (!item) return;
-    const updated = {
-      ...item,
-      targetPrice:
-        priceMinor !== null ? { amountMinor: priceMinor, currency: item.currency } : null,
-    };
-    await saveItem(updated);
+    const product = await getProduct(id);
+    if (!product) return;
+    await updateProduct({ ...product, watch: { ...product.watch, targetPrice: priceMinor } });
     await loadItems();
+  }
+
+  function handleCheckNow(id: string) {
+    chrome.runtime.sendMessage({ type: 'CHECK_NOW_PRODUCT', productId: id }, () => {
+      void chrome.runtime.lastError; // ignore SW-not-running errors
+      void loadItems();
+    });
   }
 
   const sortedItems = [...items].sort((a, b) => {
     switch (sortKey) {
-      case 'recent': {
-        const aChange = a.lastCheckedAt ?? a.createdAt;
-        const bChange = b.lastCheckedAt ?? b.createdAt;
-        return bChange - aChange;
-      }
-      case 'drop': {
-        const aDrop = priceDifferencePercent(a.initialPrice, a.currentPrice);
-        const bDrop = priceDifferencePercent(b.initialPrice, b.currentPrice);
-        return aDrop - bDrop; // most negative first
-      }
-      case 'name':
-        return a.title.localeCompare(b.title);
-      case 'added':
-        return b.createdAt - a.createdAt;
+      case 'recent': return (b.lastCheckedAt ?? b.createdAt) - (a.lastCheckedAt ?? a.createdAt);
+      case 'drop':
+        return priceDifferencePercent({ amountMinor: a.initialPriceMinor, currency: a.currency }, { amountMinor: a.currentPrice, currency: a.currency }) -
+               priceDifferencePercent({ amountMinor: b.initialPriceMinor, currency: b.currency }, { amountMinor: b.currentPrice, currency: b.currency });
+      case 'name': return a.title.localeCompare(b.title);
+      case 'added': return b.createdAt - a.createdAt;
     }
   });
 
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100">
-      {/* Header */}
       <div className="sticky top-0 bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 px-4 py-3 flex items-center justify-between z-10">
-        <h1 className="text-base font-bold text-blue-600 dark:text-blue-400">
-          {STRINGS.appName}
-        </h1>
+        <h1 className="text-base font-bold text-blue-600 dark:text-blue-400">{STRINGS.appName}</h1>
         <div className="flex gap-2">
-          <button
-            onClick={() => {
-              void detectProduct();
-            }}
-            className="text-xs px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700"
-            disabled={!pageInfo}
-          >
+          <button onClick={() => { void detectProduct(); }} className="text-xs px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700" disabled={!pageInfo}>
             + {STRINGS.save}
           </button>
-          <a
-            href={chrome.runtime.getURL('src/options/index.html')}
-            target="_blank"
-            rel="noopener noreferrer"
+          <button
+            onClick={() => { void chrome.tabs.create({ url: chrome.runtime.getURL('src/dashboard/dashboard.html') }); }}
             className="text-xs px-2 py-1 text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
-            title={STRINGS.viewOptions}
+            title={STRINGS.openDashboard}
           >
-            ⚙
-          </a>
+            {STRINGS.openDashboard}
+          </button>
+          <a href={chrome.runtime.getURL('src/options/index.html')} target="_blank" rel="noopener noreferrer"
+            className="text-xs px-2 py-1 text-gray-500 hover:text-gray-700 dark:hover:text-gray-300" title={STRINGS.viewOptions}>⚙</a>
         </div>
       </div>
-
-      {/* Save status */}
-      {saveStatus && (
-        <div className="px-4 py-2 bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-400 text-sm text-center">
-          {saveStatus}
-        </div>
-      )}
-
-      {/* Save panel */}
+      {saveStatus && <div className="px-4 py-2 bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-400 text-sm text-center">{saveStatus}</div>}
       {view === 'save' && (
         <div className="bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700">
           <div className="px-4 py-2 flex items-center justify-between">
             <span className="text-sm font-medium">{STRINGS.saveForTracking}</span>
-            <button
-              onClick={() => { setView('list'); setDetectedProduct(null); }}
-              className="text-xs text-gray-400 hover:text-gray-600"
-            >
-              {STRINGS.close}
-            </button>
+            <button onClick={() => { setView('list'); setDetectedProduct(null); }} className="text-xs text-gray-400 hover:text-gray-600">{STRINGS.close}</button>
           </div>
-          <SaveProductPanel
-            product={detectedProduct}
-            loading={detecting}
-            alreadyTracked={alreadyTracked}
-            onSave={(target) => { void handleSave(target); }}
-            onManualPrice={(price) => { void handleManualPrice(price); }}
-          />
+          <SaveProductPanel product={detectedProduct} loading={detecting} alreadyTracked={alreadyTracked}
+            onSave={(t) => { void handleSave(t); }} onManualPrice={(p) => { void handleManualPrice(p); }} />
         </div>
       )}
-
-      {/* Error state */}
-      {error && (
-        <div className="p-4 text-center text-red-600 text-sm" role="alert">
-          {error}
-        </div>
-      )}
-
-      {/* Loading state */}
-      {loading && !error && (
-        <div className="p-4 text-center text-gray-400 text-sm" role="status">
-          {STRINGS.loading}
-        </div>
-      )}
-
-      {/* Item list */}
+      {error && <div className="p-4 text-center text-red-600 text-sm" role="alert">{error}</div>}
+      {loading && !error && <div className="p-4 text-center text-gray-400 text-sm" role="status">{STRINGS.loading}</div>}
       {!loading && !error && view === 'list' && (
         <div className="p-3">
           {items.length === 0 ? (
@@ -287,38 +216,20 @@ export default function App() {
             </div>
           ) : (
             <>
-              {/* Sort controls */}
               <div className="flex gap-1 mb-3 overflow-x-auto">
                 {(['recent', 'drop', 'name', 'added'] as SortKey[]).map((key) => (
-                  <button
-                    key={key}
-                    onClick={() => setSortKey(key)}
-                    className={`text-xs px-2 py-1 rounded whitespace-nowrap ${
-                      sortKey === key
-                        ? 'bg-blue-600 text-white'
-                        : 'bg-gray-100 text-gray-600 hover:bg-gray-200 dark:bg-gray-700 dark:text-gray-300'
-                    }`}
-                  >
-                    {
-                      {
-                        recent: STRINGS.sortByRecent,
-                        drop: STRINGS.sortByDrop,
-                        name: STRINGS.sortByName,
-                        added: STRINGS.sortByAdded,
-                      }[key]
-                    }
+                  <button key={key} onClick={() => setSortKey(key)}
+                    className={`text-xs px-2 py-1 rounded whitespace-nowrap ${sortKey === key ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200 dark:bg-gray-700 dark:text-gray-300'}`}>
+                    {{ recent: STRINGS.sortByRecent, drop: STRINGS.sortByDrop, name: STRINGS.sortByName, added: STRINGS.sortByAdded }[key]}
                   </button>
                 ))}
               </div>
-
               {sortedItems.map((item) => (
-                <TrackedItemCard
-                  key={item.id}
-                  item={item}
+                <TrackedItemCard key={item.id} item={item}
                   onDelete={(id) => { void handleDelete(id); }}
                   onTogglePause={(id) => { void handleTogglePause(id); }}
-                  onSetTargetPrice={(id, price) => { void handleSetTargetPrice(id, price); }}
-                />
+                  onSetTargetPrice={(id, p) => { void handleSetTargetPrice(id, p); }}
+                  onCheckNow={(id) => handleCheckNow(id)} />
               ))}
             </>
           )}
@@ -328,5 +239,4 @@ export default function App() {
   );
 }
 
-// Make sure items load correctly
 App.displayName = 'App';

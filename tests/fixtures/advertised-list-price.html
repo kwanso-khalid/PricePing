@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<title>On-Sale Product</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Product",
+  "name": "On-Sale Widget",
+  "image": "https://example.com/widget.jpg",
+  "offers": {
+    "@type": "Offer",
+    "price": "59.99",
+    "priceCurrency": "USD",
+    "availability": "https://schema.org/InStock",
+    "priceSpecification": [
+      {
+        "@type": "PriceSpecification",
+        "priceType": "https://schema.org/ListPrice",
+        "price": "89.99",
+        "priceCurrency": "USD"
+      }
+    ]
+  }
+}
+</script>
+</head>
+<body>
+<h1>On-Sale Widget</h1>
+<div class="price-block">
+  <span class="current-price">$59.99</span>
+  <s class="was-price original-price">$89.99</s>
+</div>
+<button>Add to Cart</button>
+</body>
+</html>

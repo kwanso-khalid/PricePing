@@ -107,7 +107,9 @@ export function extractGeneric(document: Document): ExtractedProduct | null {
     imageUrl,
     currency: result.value.currency,
     inStock: true, // generic can't reliably detect this
-    confidence: 0.4, // Low confidence - user should confirm
-    method: 'adapter',
+    advertisedListPrice: null,
+    confidence: 0.35, // Tier 3 - low confidence, always
+    method: 'generic',
+    stockState: 0, // unknown — generic heuristic cannot determine stock state
   };
 }

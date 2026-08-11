@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<title>Cool T-Shirt – My Shopify Store</title>
+<meta name="shopify-checkout-api-token" content="abc123" />
+<meta property="og:title" content="Cool T-Shirt" />
+<meta property="og:price:amount" content="29.99" />
+<meta property="og:price:currency" content="USD" />
+<meta property="og:image" content="https://cdn.shopify.com/tshirt.jpg" />
+<meta property="og:availability" content="instock" />
+</head>
+<body class="template-product">
+<h1 class="product__title">Cool T-Shirt</h1>
+<div class="price">
+  <span class="price__current">$29.99</span>
+  <s class="price__compare was-price">$49.99</s>
+</div>
+<button class="btn add-to-cart">Add to cart</button>
+<script type="application/json" id="ProductJson-product-template">
+{
+  "id": 1234567890,
+  "title": "Cool T-Shirt",
+  "handle": "cool-t-shirt",
+  "available": true,
+  "featured_image": "//cdn.shopify.com/tshirt.jpg",
+  "variants": [
+    {
+      "id": 9876543210,
+      "price": 2999,
+      "compare_at_price": 4999,
+      "available": true
+    }
+  ]
+}
+</script>
+</body>
+</html>

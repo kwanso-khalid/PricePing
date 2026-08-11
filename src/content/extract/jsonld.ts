@@ -1,8 +1,17 @@
-import type { ExtractedProduct } from '../../types/index.js';
+import type { ExtractedProduct, Money } from '../../types/index.js';
+import type { StockStateCode } from '../../types/storage.js';
 import { parsePrice } from '../../lib/money.js';
 import { createLogger } from '../../lib/logger.js';
+import { parseStockState, stockStateToInStock } from './stockstate.js';
 
 const logger = createLogger('extract:jsonld');
+
+interface PriceSpecification {
+  '@type'?: string;
+  priceType?: string;
+  price?: number | string;
+  priceCurrency?: string;
+}
 
 interface JsonLdOffer {
   '@type'?: string;
@@ -12,6 +21,7 @@ interface JsonLdOffer {
   lowPrice?: string | number;
   highPrice?: string | number;
   offers?: JsonLdOffer | JsonLdOffer[];
+  priceSpecification?: PriceSpecification | PriceSpecification[];
 }
 
 interface JsonLdProduct {
@@ -55,6 +65,30 @@ function extractImage(image: JsonLdProduct['image']): string | null {
   return null;
 }
 
+/**
+ * Extract advertised list price from priceSpecification array/object.
+ * Looks for an entry with priceType containing "List" or "MSRP".
+ */
+function extractListPriceFromSpec(
+  spec: PriceSpecification | PriceSpecification[] | undefined,
+  currency: string,
+): Money | null {
+  if (!spec) return null;
+  const specs = Array.isArray(spec) ? spec : [spec];
+  for (const s of specs) {
+    const type = (s.priceType ?? '').toLowerCase();
+    if (type.includes('list') || type.includes('msrp') || type.includes('rrp')) {
+      const raw = s.price;
+      if (raw === undefined || raw === null) continue;
+      const priceStr = String(raw);
+      const cur = s.priceCurrency ?? currency;
+      const result = parsePrice(priceStr, cur);
+      if (result.ok) return result.value;
+    }
+  }
+  return null;
+}
+
 function parseJsonLdNode(node: JsonLdProduct): ExtractedProduct | null {
   if (!isProduct(node)) return null;
 
@@ -75,13 +109,22 @@ function parseJsonLdNode(node: JsonLdProduct): ExtractedProduct | null {
   }
 
   const availability = offer?.availability ?? '';
-  const inStock =
-    !availability ||
-    availability.includes('InStock') ||
-    availability.includes('PreOrder') ||
-    availability.includes('OnlineOnly');
+  const stockState: StockStateCode = parseStockState(availability);
+  const inStock = stockStateToInStock(stockState);
 
   const imageUrl = extractImage(node.image);
+
+  // --- Advertised list price ---
+  let advertisedListPrice: Money | null = null;
+
+  // 1. priceSpecification with priceType=ListPrice
+  if (!advertisedListPrice && offer?.priceSpecification) {
+    advertisedListPrice = extractListPriceFromSpec(offer.priceSpecification, result.value.currency);
+  }
+
+  // 2. AggregateOffer: if offer has lowPrice and highPrice, highPrice might be list price
+  //    but this is ambiguous — only use if the offer type is explicitly AggregateOffer
+  //    and we haven't found a list price yet. Skip: too unreliable.
 
   return {
     title: String(title),
@@ -89,8 +132,10 @@ function parseJsonLdNode(node: JsonLdProduct): ExtractedProduct | null {
     imageUrl,
     currency: result.value.currency,
     inStock,
+    advertisedListPrice,
     confidence: 0.9,
     method: 'jsonld',
+    stockState,
   };
 }
 

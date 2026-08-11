@@ -1,259 +1,502 @@
-# PriceWatch Codebase Audit
+# PriceWatch — Codebase Audit
 
-Scope: local-only Chrome MV3 extension. Everything inferred from code.
-No guesses about intent or future state.
+Phase 1a. Every claim is inferred from code. File and line citations given for
+anything non-obvious. No guesses.
 
 ---
 
-## 1. ARCHITECTURE MAP
+## 1. Architecture map
 
-### Files and responsibilities
+### File inventory
 
 | File | Responsibility |
 |---|---|
-| `manifest.json` | MV3 manifest. Permissions: storage, alarms, notifications, activeTab, scripting. Optional host: `<all_urls>`. Service worker: `service-worker-loader.js`. |
-| `src/background/index.ts` | Service worker entry. Registers: `onInstalled`/`onStartup` → `setupAlarm()`; `alarm` → `runCheckPass()` then `processNotifications()`; `notifications.onClicked` → `handleNotificationClick()`; `runtime.onMessage` (PING / RUN_CHECK). No module-level state intended to survive eviction. |
-| `src/background/scheduler.ts` | Creates alarm `pricewatch-check` (1 min initial delay, 30 min period). Idempotent check before create. |
-| `src/background/checker.ts` | `runCheckPass()`: reads settings + items; filters ≤10 due items; groups by hostname; staggered sequential fetch with 2–8 s jitter; 15 s AbortController timeout; DOMParser parse; `extractProduct`; `applyCheckResult` → `saveItem`. `shouldTriggerNotification` is a pure exported function also used by notifier. |
-| `src/background/notifier.ts` | `processNotifications()`: reads all items; filters by `shouldTriggerNotification`; sends batch (`≥3`) or individual `chrome.notifications.create`; marks items notified in storage. `handleNotificationClick`: opens product tab or popup. |
-| `src/content/index.ts` | Injected on demand via `chrome.scripting.executeScript({ files })`. Runs `extractProduct(document, hostname)`, stores result in `window.__pricewatch_result__` (isolated world). Popup retrieves with a second `executeScript({ func })`. |
-| `src/content/extract/index.ts` | Runs strategies in order: **adapter → jsonld → microdata → opengraph → generic**. Returns highest-confidence result; short-circuits at confidence ≥ 0.9. |
-| `src/content/extract/jsonld.ts` | Parses `<script type="application/ld+json">`. Handles `@graph`, arrays, nested offers. Confidence 0.9. |
-| `src/content/extract/microdata.ts` | Reads `itemprop="price"`, `itemprop="priceCurrency"`. Confidence 0.8. |
-| `src/content/extract/opengraph.ts` | Reads `og:price:amount`, `og:price:currency`, `product:price:amount`. Confidence 0.75. |
-| `src/content/extract/adapters/amazon.ts` | Amazon CSS selectors for price, title, image, availability. Confidence 0.95. |
-| `src/content/extract/adapters/ebay.ts` | eBay selectors. Confidence 0.92. |
-| `src/content/extract/adapters/generic.ts` | Generic DOM heuristic (price-shaped text near `h1`, excludes was/old classes). Confidence 0.40. **Bug: returns `method: 'adapter'`** instead of a distinct value. |
-| `src/content/extract/adapters/index.ts` | Registry mapping hostname arrays to extractor functions. Amazon: 10 domains. eBay: 5 domains. |
-| `src/popup/App.tsx` | Loads items from storage; queries active tab; two-phase content script injection on "+ Save"; builds `TrackedItem`; calls `saveItem`. |
-| `src/popup/components/SaveProductPanel.tsx` | Shows detected product card, target-price input, manual price-entry fallback. |
-| `src/popup/components/TrackedItemCard.tsx` | Per-item card: inline SVG sparkline (`SparklineChart`), prices, % change, pause/delete/target-price actions. Shows `⚠ Needs attention` when `consecutiveFailures ≥ 5`. |
-| `src/popup/components/SparklineChart.tsx` | Renders `PricePoint[]` history as inline SVG polyline. |
-| `src/options/App.tsx` | Check interval slider, notifications toggle, mute selector, JSON export/import with structural validation. |
-| `src/lib/storage.ts` | Typed wrapper over `chrome.storage.local`. Single key `pricewatch_data`. Schema v1. Migration runner (v0→v1). 5 MB soft quota pre-write guard. |
-| `src/lib/money.ts` | `parsePrice`: locale-aware string → `Money` (integer minor units). `formatMoney`, `isLessThan`, `sameCurrency`, `priceDifferencePercent`. No float storage. |
-| `src/lib/backoff.ts` | `isDueForCheck` (base 6 h, cap 72 h). `staggerDelayMs` (2–8 s). |
-| `src/lib/history.ts` | `addPricePoint` + `downsampleHistory`. Cap 200. Downsamples points older than 90 days to 1/day (keeps latest per calendar day). |
-| `src/lib/logger.ts` | Structured console logger. Production: warn/error only. Dev: all levels. `globalThis.console` used to survive SW context. |
-| `src/lib/result.ts` | `Result<T,E>` type. No throwing across module boundaries. |
-| `src/lib/strings.ts` | All user-visible strings. |
-| `src/lib/url.ts` | `canonicalizeUrl`: strips 30+ tracking params, Amazon `/ref=` path segments, normalises scheme/host, sorts remaining params. |
-| `src/types/index.ts` | Canonical types: `TrackedItem`, `Money`, `PricePoint`, `StorageSchema`, `AppSettings`, `NotificationState`, `CheckResult`, `ExtractedProduct`. |
+| `manifest.json` | MV3 manifest. Permissions: storage, alarms, notifications, activeTab, scripting. No host permissions. |
+| `src/background/index.ts` | Service worker entry. Registers four listener groups synchronously at module level: `onInstalled`/`onStartup` → `setupAlarm()`; `alarms.onAlarm` → `runCheckPass()` + `processNotifications()`; `notifications.onClicked` → `handleNotificationClick()`; `runtime.onMessage` (PING / RUN_CHECK). No module-level mutable state. |
+| `src/background/scheduler.ts` | `setupAlarm()`: creates `pricewatch-check` alarm (1 min initial, 30 min period). Idempotent — checks for existing alarm before creating. `void`s the create call (risk: see R1). |
+| `src/background/checker.ts` | `runCheckPass()`: reads settings + all items; filters to ≤ 10 items due for checking; groups by hostname; sequential fetch with 2–8 s `setTimeout` stagger; 15 s `AbortController` timeout; `DOMParser` parse; `extractProduct`; `applyCheckResult` → `saveItem`. `shouldTriggerNotification` and `applyCheckResult` are pure functions exported and tested separately. |
+| `src/background/notifier.ts` | `processNotifications()`: reads all items; filters by `shouldTriggerNotification`; sends batch (≥ 3 items) or individual `chrome.notifications.create`; marks items notified in storage. `handleNotificationClick()`: opens product tab or popup. |
+| `src/content/index.ts` | Injected on demand via `executeScript({ files })`. Runs `extractProduct(document, hostname)`; stores result at `window.__pricewatch_result__` in the page's isolated world. Popup retrieves with a second `executeScript({ func })`. |
+| `src/content/extract/index.ts` | Layered strategy runner. Order: **adapter → jsonld → microdata → opengraph → generic**. Returns highest-confidence result; short-circuits if confidence ≥ 0.9. All strategies wrapped in try/catch; errors are logged, not thrown. |
+| `src/content/extract/jsonld.ts` | Parses all `<script type="application/ld+json">` tags. Handles `@graph` wrapper, root arrays, nested offers. Resolves `offer.lowPrice` if `price` absent. No `advertisedListPrice` / `highPrice` captured. Confidence: 0.9. |
+| `src/content/extract/microdata.ts` | Reads `itemprop="price"`, `itemprop="priceCurrency"`, `itemprop="availability"`. Confidence: 0.8. |
+| `src/content/extract/opengraph.ts` | Reads `og:price:amount`, `og:price:currency`, `product:price:amount`. Confidence: 0.75. |
+| `src/content/extract/adapters/amazon.ts` | Amazon CSS selectors for price (8 candidates), title, image, availability. Currency inferred from `lang` attribute and hostname suffix. No "was" price captured. Confidence: 0.95. Returns `method: 'adapter'`. |
+| `src/content/extract/adapters/ebay.ts` | eBay selectors for price (4 candidates), title, image, availability. No "was" price. Confidence: 0.92. Returns `method: 'adapter'`. |
+| `src/content/extract/adapters/generic.ts` | Generic DOM heuristic. Title from `h1` variants; price from class/id substrings matching "price", excluding "was/old/original" classes. Confidence: 0.40. **Bug: returns `method: 'adapter'`** (should be `'generic'` or a tier identifier). |
+| `src/content/extract/adapters/index.ts` | Adapter registry. Amazon: 10 domains. eBay: 5 domains. No Shopify, WooCommerce, or other platform adapters. |
+| `src/popup/App.tsx` | Root popup component. Loads items on mount; queries active tab; two-phase content script injection on "+ Save"; builds `TrackedItem` and calls `saveItem`. Dedup by comparing `pageInfo.url` against `item.url` (canonical URL equality). Sort: recent change / biggest drop / name / date added. |
+| `src/popup/components/SaveProductPanel.tsx` | Detected-product card with target-price input and manual-price fallback. |
+| `src/popup/components/TrackedItemCard.tsx` | Per-item card. Shows `⚠ Needs attention` when `consecutiveFailures ≥ 5`. No distinction between blocked and error states. Price change is % vs `initialPrice`, not vs last checked. |
+| `src/popup/components/SparklineChart.tsx` | Inline SVG polyline from `PricePoint[]`. No gap rendering — plots `history.length - 1` segments with evenly spaced x-positions regardless of `observedAt` timestamps. **Gaps in observation time appear as straight lines, not gaps.** |
+| `src/popup/main.tsx` | React root mount into `#root`. |
+| `src/options/App.tsx` | Check-interval slider (1–24 h), notifications toggle, mute select, JSON export/import with structural validation. `perSiteEnabled` in schema but no UI to edit it. |
+| `src/lib/storage.ts` | Typed wrapper over `chrome.storage.local`. Single key `pricewatch_data`. Schema v1. Migration runner (v0 → v1). 5 MB soft quota guard (pre-write JSON byte estimate via `Blob.size`). Every public function: `loadSchema() → mutate → saveSchema()`. |
+| `src/lib/money.ts` | `parsePrice`: locale-aware string → `Money`. `formatMoney`, `compareMoney`, `isLessThan`, `sameCurrency`, `priceDifferencePercent`, `moneyFromMinor`. Throws on cross-currency comparison. |
+| `src/lib/history.ts` | `addPricePoint` + `downsampleHistory`. Cap: 200 points. Downsamples points older than 90 days to 1 per calendar day (keeps latest). |
+| `src/lib/backoff.ts` | `calculateBackoffMs`, `checkerBackoffMs` (base 6 h, cap 72 h), `isDueForCheck`, `staggerDelayMs` (2–8 s). |
+| `src/lib/logger.ts` | Structured console logger. Production min level: `'warn'` (via `import.meta.env.DEV` check). Dev: all levels. Output to `globalThis.console` (safe in SW context). |
+| `src/lib/url.ts` | `canonicalizeUrl`: strips 30+ tracking params, Amazon `/ref=` path segments, forces HTTPS, lowercases hostname, sorts remaining params. `getHostname`: strips `www.`. |
+| `src/lib/result.ts` | `Result<T, E>` type with `ok`, `err`, `isOk`, `isErr`, `mapResult`, `unwrapOr`. |
+| `src/lib/strings.ts` | All user-visible strings. `perSiteSettings` string exists but no UI renders it. |
+| `src/types/index.ts` | All shared types (see §2). |
 | `vite.config.ts` | Main build: popup + options + service worker via crxjs. |
-| `vite.content.config.ts` | Separate IIFE build for content script → `dist/src/content/index.js`. |
+| `vite.content.config.ts` | Separate IIFE build → `dist/src/content/index.js`. |
+| `tests/setup.ts` | Vitest global setup. Full Chrome API mock (storage, runtime, alarms, notifications, tabs, scripting, action). Default: storage reads return `{}`, writes succeed. |
 
-### Data flow: "user clicks Save" → "notification fires"
+### Data flow: "user marks a product" → "notification fires"
 
 ```
-User visits product page → clicks popup icon
-
-1. Popup mount
-   chrome.tabs.query(active) → tab.url, tab.id
-   canonicalizeUrl(tab.url) → pageInfo.url
-   getAllItems() → items (from chrome.storage.local)
+1. User visits product page, opens popup
+   chrome.tabs.query({ active: true, currentWindow: true })
+   → tab.url, tab.id
+   → canonicalizeUrl(tab.url) → pageInfo.url
+   getAllItems() → loadSchema() → chrome.storage.local.get('pricewatch_data')
+   → items[] rendered in popup
 
 2. User clicks "+ Save"
-   chrome.scripting.executeScript({ files: ['src/content/index.js'] })
-     [content script, isolated world]
-     extractProduct(document, hostname) → ExtractedProduct | null
+   chrome.scripting.executeScript({ target: { tabId }, files: ['src/content/index.js'] })
+     [content script runs in page's isolated world]
+     extractProduct(document, hostname)
+       tries: adapter → jsonld → microdata → opengraph → generic
+       → ExtractedProduct { title, price, imageUrl, currency, inStock, confidence, method }
      window.__pricewatch_result__ = { success, product }
-   chrome.scripting.executeScript({ func: () => window.__pricewatch_result__ })
-   popup receives ExtractedProduct
+   chrome.scripting.executeScript({ target: { tabId }, func: () => window.__pricewatch_result__ })
+   → popup receives ExtractedProduct (or null → manual-price fallback)
 
 3. User clicks "Track Product"
    builds TrackedItem {
      id: uuidv4(),
      url: pageInfo.url (canonical),
-     initialPrice: detectedProduct.price,
-     currentPrice: detectedProduct.price,
+     initialPrice: product.price,
+     currentPrice: product.price,
      history: [{ price, observedAt: now, inStock }],
-     consecutiveFailures: 0, paused: false, ...
+     consecutiveFailures: 0, paused: false,
+     extractionMethod: product.method,
+     ...
    }
-   saveItem(item) → loadSchema() → mutate → chrome.storage.local.set
+   saveItem(item) → loadSchema() → schema.items[id] = item → chrome.storage.local.set
 
-4. chrome.alarms fires 'pricewatch-check' (every 30 min)
-   service worker cold-starts; all state re-read from storage
+4. chrome.alarms fires 'pricewatch-check' every 30 minutes
+   service worker may have been evicted and cold-starts
 
 5. runCheckPass()
-   getAllItems() + getSettings() from storage
-   filter: !paused && isDueForCheck(lastCheckedAt, failures, intervalMs)
+   getAllItems() + getSettings() from chrome.storage.local.get('pricewatch_data')
+   filter: !paused && isDueForCheck(lastCheckedAt, consecutiveFailures, checkIntervalMs)
    slice to MAX 10 items
-   group by hostname; for each item:
-     [optional] setTimeout stagger 2–8 s   ← SW timeout risk (see R4)
-     fetch(url, { signal: AbortController(15s) })
-     DOMParser.parseFromString → Document
+   group by hostname
+   for each item (sequential):
+     [if not first] setTimeout stagger 2–8 s   ← see R4
+     fetch(url, { signal: AbortController(15s), credentials: 'omit', ... })
+     → HTTP error → status: 'error'
+     DOMParser.parseFromString(html, 'text/html') → Document
      extractProduct(doc, hostname) → ExtractedProduct | null
-     isBlockedResponse check (bot-detection keywords)
-     sameCurrency check
-     applyCheckResult → updated TrackedItem
-     saveItem(updatedItem) → loadSchema() → mutate → chrome.storage.local.set
+     isBlockedResponse(doc, extracted) → if null + bot keywords → status: 'blocked'
+     sameCurrency check → mismatch → status: 'error'
+     → status: 'ok', product: ExtractedProduct
+     applyCheckResult(item, result, now)
+       'ok': update currentPrice; if changed, addPricePoint to history; check shouldTriggerNotification
+       'error': consecutiveFailures++; ≥5 → logger.error only
+       'blocked': consecutiveFailures++
+     saveItem(updatedItem) → chrome.storage.local.set
 
 6. processNotifications()
    getAllItems() from storage
    filter: shouldTriggerNotification(item)
-     cooldown: lastNotifiedAt within 24 h → skip
-     dedup: currentPrice.amountMinor >= lastNotifiedPriceMinor → skip
-     trigger: currentPrice < targetPrice, or < initialPrice if no target
-   ≥3 items → sendBatchNotification; else individual
+     • cooldown: lastNotifiedAt within 24 h → skip
+     • dedup: currentPrice.amountMinor >= lastNotifiedPriceMinor → skip
+     • trigger: currentPrice < targetPrice, or if no target, currentPrice < initialPrice
+   ≥ 3 items → sendBatchNotification; else sendItemNotification per item
    chrome.notifications.create(...)
-   saveItem per notified item (lastNotifiedAt, lastNotifiedPriceMinor updated)
+   for each notified item:
+     saveItem({ ...item, lastNotifiedAt: now, lastNotifiedPriceMinor: current })
 
 7. User clicks notification
-   chrome.notifications.onClicked → handleNotificationClick
-   chrome.tabs.create({ url: item.url })
+   chrome.notifications.onClicked → handleNotificationClick(notificationId)
+   item notification → getAllItems() → chrome.tabs.create({ url: item.url })
+   batch notification → chrome.action.openPopup() (may fail outside user gesture)
+   chrome.notifications.clear(notificationId)
 ```
 
 **State at each hop**
 
-| Hop | Where |
+| Hop | Where state lives |
 |---|---|
-| Tab / page info | `chrome.tabs` API (ephemeral) |
-| Extracted product | `window.__pricewatch_result__`, page isolated world (ephemeral) |
-| Popup React state | `useState` (popup lifetime only) |
-| Items, settings, notification state | `chrome.storage.local`, key `pricewatch_data` |
-| Alarm schedule | `chrome.alarms` (persists across SW evictions) |
+| Tab URL and ID | `chrome.tabs` API — ephemeral |
+| Extracted product | `window.__pricewatch_result__` in page isolated world — ephemeral, tab-scoped |
+| Popup React state | `useState` — popup lifetime only, lost on close |
+| All persistent data | `chrome.storage.local`, key `pricewatch_data` |
+| Alarm schedule | `chrome.alarms` — survives SW eviction |
 
 ---
 
-## 2. CURRENT DATA MODEL
+## 2. Current data model
 
-Single storage key: **`pricewatch_data`** in `chrome.storage.local`.
+Single key in `chrome.storage.local`: **`pricewatch_data`**
+
+Everything is one JSON blob. One `chrome.storage.local.get` call deserializes the
+entire dataset. One `chrome.storage.local.set` call serializes and writes it all.
 
 ```typescript
-// src/lib/storage.ts:9
-StorageSchema {
-  schemaVersion: number          // 1 currently
-  items: Record<string, TrackedItem>   // keyed by TrackedItem.id (UUID)
+// Key: 'pricewatch_data'
+StorageSchema {                            // src/types/index.ts:46
+  schemaVersion: number                   // 1 currently
+  items: Record<string, TrackedItem>      // keyed by TrackedItem.id (UUID v4)
   settings: AppSettings
   notifications: NotificationState
 }
 
-// src/types/index.ts:16-34
-TrackedItem {
-  id: string                     // UUID v4
-  url: string                    // canonical URL
+TrackedItem {                             // src/types/index.ts:16
+  id: string                             // UUID v4
+  url: string                            // canonical URL (tracking params stripped)
   title: string
   imageUrl: string | null
-  hostname: string               // www. stripped
-  currency: CurrencyCode         // ISO 4217 string — not validated beyond being a string
-  initialPrice: Money            // price at save time
-  currentPrice: Money            // most-recently checked price
+  hostname: string                       // www. stripped
+  currency: CurrencyCode                 // ISO 4217 string, not validated beyond typeof
+  initialPrice: Money                    // price at save time
+  currentPrice: Money                    // most-recently extracted price
   targetPrice: Money | null
-  history: PricePoint[]          // max 200; >90 d downsampled to 1/day
-  createdAt: number              // epoch ms
-  lastCheckedAt: number | null
-  lastNotifiedAt: number | null
-  lastNotifiedPriceMinor: number | null
+  history: PricePoint[]                  // inline, max 200, >90d downsampled to 1/day
+  createdAt: number                      // epoch ms
+  lastCheckedAt: number | null           // epoch ms
+  lastNotifiedAt: number | null          // epoch ms
+  lastNotifiedPriceMinor: number | null  // for notification dedup
   consecutiveFailures: number
   paused: boolean
-  extractionMethod: 'jsonld'|'opengraph'|'microdata'|'adapter'|'manual'
+  extractionMethod: ExtractionMethod     // one value for the whole item, not per observation
 }
 
-// src/types/index.ts:3-6
-Money {
-  amountMinor: number            // integer (e.g. 1999 = $19.99)
+Money {                                  // src/types/index.ts:3
+  amountMinor: number                   // integer (e.g. 1999 = $19.99)
   currency: CurrencyCode
 }
 
-// src/types/index.ts:8-12
-PricePoint {
+PricePoint {                             // src/types/index.ts:8
   price: Money
-  observedAt: number             // epoch ms
+  observedAt: number                    // epoch ms
   inStock: boolean
+  // NO advertisedListPrice field
+  // NO parseTier field
 }
 
-// src/types/index.ts:53-58
-AppSettings {
-  checkIntervalHours: number     // default 6, range 1-24
+AppSettings {                            // src/types/index.ts:53
+  checkIntervalHours: number            // default 6
   notificationsEnabled: boolean
-  mutedUntil: number | null      // epoch ms
-  perSiteEnabled: Record<string, boolean>  // stored but never consulted (dead field)
+  mutedUntil: number | null             // epoch ms
+  perSiteEnabled: Record<string, boolean>  // stored, never read by any logic
 }
 
-// src/types/index.ts:60-63
-NotificationState {
+NotificationState {                      // src/types/index.ts:60
   lastBatchNotificationAt: number | null
-  recentlyNotifiedItemIds: string[]  // appended but never read (dead field)
+  recentlyNotifiedItemIds: string[]     // appended, never read
 }
 ```
 
-**Migration history** (`src/lib/storage.ts:36-57`):
+**Serialization:** Standard `JSON.stringify` / `JSON.parse`. All numbers are
+stored as numbers (not strings). Epoch ms throughout.
 
-| v0 → v1 | Added `consecutiveFailures`, `paused`, `lastNotifiedAt`, `lastNotifiedPriceMinor` to existing items |
+**Migration history** (`src/lib/storage.ts:36`):
 
----
-
-## 3. BLOCKERS
-
-### a. Storing price history as a time series
-
-**Not blocked — partially implemented, but sparse and inline.**
-
-`TrackedItem.history: PricePoint[]` exists. `addPricePoint` in `history.ts` is called on every price *change* (not every poll — `checker.ts:184` guards on `priceChanged`). This is the correct design.
-
-Limitations relevant to Phase 1:
-- History lives inline inside `TrackedItem`, which lives inside the single `pricewatch_data` blob. Every history query deserialises the full blob.
-- No `advertisedListPrice` field anywhere in `PricePoint` or `TrackedItem`. Phase 3 fake-discount detection cannot be built on the current model.
-- Cap is 200 points (Phase 1 spec wants 400, plus permanent all-time min/max).
-- No sanity guard: any extracted price, including obviously wrong ones, writes to history.
-
-**Fix type:** Additive for the time-series shape itself. Refactor required for the `advertisedListPrice` field, cap change, and sanity guard.
+| Version | Change |
+|---|---|
+| v0 → v1 | Adds `consecutiveFailures`, `paused`, `lastNotifiedAt`, `lastNotifiedPriceMinor` to any item missing them |
 
 ---
 
-### b. Storing the retailer's advertised "was" price separately from current price
+## 3. Storage budget
 
-**Blocked completely.**
+### Per-item size today
 
-Neither `PricePoint` nor `TrackedItem` has an `advertisedListPrice` or `wasPrice` field. None of the extraction strategies (`jsonld.ts`, `opengraph.ts`, `microdata.ts`, `amazon.ts`, `ebay.ts`) extract a "was" or strikethrough price. `ExtractedProduct` has no such field.
+Measured by serializing representative `TrackedItem` JSON objects.
 
-Phase 3 fake-discount detection is entirely built on comparing the retailer's stated "was" price against our observed history. Without this field, Phase 3 cannot function at all.
+**Base item, no history (object keys included):**
 
-**Fix type:** Refactor of the data model (`PricePoint`, `TrackedItem`, `ExtractedProduct`) plus new extraction logic in every strategy and every adapter. This is a load-bearing Phase 2 deliverable gating Phase 3.
+Fields serialized as JSON:
+
+| Field | Typical bytes |
+|---|---|
+| `"id":"xxxxxxxx-xxxx-4xxx-xxxx-xxxxxxxxxxxx"` | 42 |
+| `"url":"https://example.com/product/widget-blue"` | 55 |
+| `"title":"Product name of typical length here"` | 50 |
+| `"imageUrl":"https://cdn.example.com/images/product.jpg"` | 60 |
+| `"hostname":"example.com"` | 22 |
+| `"currency":"USD"` | 15 |
+| `"initialPrice":{"amountMinor":9999,"currency":"USD"}` | 50 |
+| `"currentPrice":{"amountMinor":9999,"currency":"USD"}` | 50 |
+| `"targetPrice":null` | 16 |
+| `"history":[]` | 11 |
+| `"createdAt":1722000000000` | 25 |
+| `"lastCheckedAt":1722000000000` | 28 |
+| `"lastNotifiedAt":null` | 22 |
+| `"lastNotifiedPriceMinor":null` | 28 |
+| `"consecutiveFailures":0` | 24 |
+| `"paused":false` | 14 |
+| `"extractionMethod":"jsonld"` | 27 |
+| Braces, commas, whitespace | ~20 |
+| **Base total** | **~559 bytes** |
+
+**Per `PricePoint`** (inline in `history[]`):
+
+```json
+{"price":{"amountMinor":9999,"currency":"USD"},"observedAt":1722000000000,"inStock":true}
+```
+= **88 bytes**
+
+**Item totals by history depth:**
+
+| History points | Item size | Notes |
+|---|---|---|
+| 0 | ~560 B | Just saved, never checked |
+| 10 | ~1.4 KB | ~10 price changes |
+| 50 | ~5.0 KB | ~1 year of weekly changes |
+| 100 | ~9.4 KB | |
+| 200 (cap) | ~18.2 KB | Max under current cap |
+
+**In practice:** History grows only on price *changes*, not every poll. A product
+polled every 6 hours that changes price once a week accumulates ~52 points/year.
+At 2 years: ~104 points ≈ ~9.7 KB per item.
+
+### Top-level overhead (non-item fields)
+
+| Field | Size |
+|---|---|
+| `schemaVersion` | ~20 B |
+| `settings` | ~120 B |
+| `notifications` (50 UUID strings) | ~1.9 KB |
+| Object boilerplate | ~30 B |
+| **Total overhead** | **~2.1 KB** |
+
+### Projection to 100 products
+
+**All data is under one storage key.** Every read and write touches every item
+regardless of how many items changed.
+
+| Scenario | Per-item avg | 100-item total | % of 10 MB quota |
+|---|---|---|---|
+| Sparse history (avg 25 pts) | ~2.8 KB | ~282 KB | 2.8% |
+| Typical (avg 75 pts) | ~7.2 KB | ~722 KB | 7.2% |
+| Dense (200 pts cap, volatile prices) | ~18.2 KB | ~1.82 MB | 18.2% |
+
+**Quota verdict:** At 100 products the 10 MB limit is not a concern even in the
+dense case. The existing 5 MB soft guard (`storage.ts:10`) is overly conservative
+and would fire at ~270 typical-history items or ~55 fully-loaded items.
+`unlimitedStorage` is not needed at this scale.
+
+**Write cost is the real problem, not quota.** Every `saveItem` call:
+1. `JSON.parse` of the entire blob (up to 1.8 MB at 100 dense items)
+2. Mutate one item
+3. `JSON.stringify` of the entire blob
+4. `chrome.storage.local.set` (which itself serializes again internally)
+
+After a 10-item check pass + notifications, that is 20+ full-blob cycles.
+At 100 items with dense history, each cycle can exceed 1 MB of
+serialization work, all blocking the service worker event loop. This is the
+primary structural reason to shard storage in Phase 1b.
+
+---
+
+## 4. Blockers
+
+### a. Price history as a time series
+
+**Not blocked at the data level — blocked at the presentation level.**
+
+`TrackedItem.history: PricePoint[]` exists and is populated correctly (only on
+price changes, `checker.ts:184`). `addPricePoint` and `downsampleHistory` work.
+
+What is missing or wrong:
+
+1. **No `observedAt`-based x-axis in the sparkline.** `SparklineChart.tsx:30`
+   distributes points evenly across the SVG width by index, not by timestamp.
+   A gap of three weeks between two observations is drawn as one segment
+   identical to a gap of one day. A smooth line through missing data is a lie.
+
+2. **No `advertisedListPrice` field** anywhere in `PricePoint`, `TrackedItem`,
+   or `ExtractedProduct`. No extraction logic for it. Phase 3 fake-discount
+   detection requires this field on every observation.
+
+3. **Cap is 200 points** (Phase 1b spec wants 400 plus permanent allTimeMin /
+   allTimeMax). The current `downsampleHistory` drops the oldest points when
+   trimming, so trimming permanently loses the historical minimum if it is old.
+
+4. **No sanity guard.** Any extracted price, including obviously wrong ones from
+   the generic heuristic, writes directly to history and updates `currentPrice`.
+
+5. **No parse tier per observation.** `extractionMethod` is one value on the
+   whole `TrackedItem`, not stamped per `PricePoint`. After Phase 2 introduces
+   tiers, there is no way to know which tier produced each stored observation.
+
+**Fix type for items 2–5:** Refactor of `PricePoint`, `TrackedItem`, and
+`ExtractedProduct`, plus new extraction logic. This is Phase 1b + Phase 2.
+**Fix type for item 1:** Additive — change `SparklineChart` x-calculation.
+
+---
+
+### b. Storing the advertised "was" price separately from current price
+
+**Fully blocked. Nothing in the current codebase captures this field.**
+
+- `ExtractedProduct` has no `advertisedListPrice` field (`types/index.ts:36`).
+- `PricePoint` has no `listPriceMinor` field (`types/index.ts:8`).
+- `TrackedItem` has no `advertisedListPrice` field.
+- No extraction strategy reads a strikethrough price. `jsonld.ts` resolves
+  `offer.lowPrice` but ignores `offer.highPrice`. Amazon and eBay adapters read
+  the current price selector only.
+
+Phase 3 fake-discount detection is built entirely on comparing the retailer's
+stated "was" price to our observed history. Without this field, Phase 3 cannot
+function at all.
+
+**Fix type:** Refactor of all three types plus new extraction logic in every
+strategy. The Shopify `compare_at_price` field (Phase 2 Tier 2) provides this
+automatically; JSON-LD `offer.highPrice` sometimes carries it; HTML strikethrough
+elements require per-site heuristics. This is a Phase 2 deliverable that gates
+Phase 3.
 
 ---
 
 ### c. Suppressing duplicate and trivial notifications
 
-**Partially done — three of the required suppressions exist; three do not.**
+**Three suppressions exist; three are missing.**
 
 **Exists:**
-- 24-hour cooldown per item (`checker.ts:238-241`, `lastNotifiedAt` field)
-- Dedup by price level: never notify for same or higher price than last alert (`checker.ts:243-248`, `lastNotifiedPriceMinor` field)
-- Global mute toggle (`notifier.ts:24-28`, `settings.mutedUntil`)
+- 24-hour per-item cooldown (`checker.ts:238`, `lastNotifiedAt`)
+- Price-level dedup: no re-notify at same or higher price (`checker.ts:243`, `lastNotifiedPriceMinor`)
+- Global mute toggle (`notifier.ts:24`, `settings.mutedUntil`)
 
 **Missing:**
-- Minimum delta filter: no `MIN_DELTA_PCT` guard. A $0.40 wobble on a $300 item fires every 24 hours indefinitely as long as the price stays below the last alert price.
-- Idempotency key per alert: no hash of `(watchId, priceMinorUnits, dayBucket)` stored. A service worker restart mid-notification pass can double-send.
-- Quiet hours: no local-timezone time window. Notifications fire immediately regardless of time of day.
 
-**Fix type:** Additive. New fields on `Watch`/`TrackedItem` (sentAlertKeys, quietHoursStart/End) plus logic changes in `shouldTriggerNotification` and `processNotifications`.
+1. **Minimum delta filter.** No `MIN_DELTA_PCT` check. A $0.40 wobble on a $300
+   item (0.13%) fires every time cooldown expires, as long as price stays below
+   `lastNotifiedPriceMinor`. Plan requires `price <= lastAlertedPrice * (1 - 0.03)`.
 
----
+2. **Idempotency key.** No hash of `(productId, priceMinorUnits, dayBucket)`
+   stored or checked. A service worker eviction mid-notification pass, or a
+   `RUN_CHECK` message arriving while an alarm is also running, can double-send.
 
-### d. Failing closed when a selector breaks, instead of showing a stale price
+3. **Quiet hours.** No time-of-day suppression. Notifications fire at any hour.
+   Plan requires hold-not-drop with overnight coalescing.
 
-**Partially done — the extension does not show stale prices as current, but it also does not surface the failure distinctly.**
+4. **Tier gate.** No check that `extractionMethod === 'adapter'` means a
+   reliable tier (due to the `method: 'adapter'` bug in generic.ts, this check
+   would be wrong even if it existed). Plan requires Tier 1 or 2 only for alerts.
 
-What currently happens when extraction fails:
-1. `checkItem` returns `{ status: 'error', message }` or `{ status: 'blocked' }`.
-2. `applyCheckResult` increments `consecutiveFailures`. At ≥5, a logger error fires.
-3. `TrackedItemCard` shows a `⚠ Needs attention` badge when `consecutiveFailures ≥ 5` (`TrackedItemCard.tsx:49, 100-104`).
-4. The current price displayed is whatever was last successfully extracted — it is not marked as stale.
-
-What is missing:
-- No `parseStatus` field on `TrackedItem` (Phase 1 spec adds this). The "paused" flag means user-paused, not extraction-paused; they are conflated.
-- No distinction in the UI between "blocked" (site blocks fetches) and "error" (extraction failed). Both just increment `consecutiveFailures`.
-- The `⚠` badge only appears after 5 consecutive failures. Failures 1–4 are invisible.
-- The generic adapter returns `method: 'adapter'` (`generic.ts:111`), making it indistinguishable from Amazon/eBay adapters in storage. Logic that gates on `extractionMethod` cannot identify generic-heuristic items.
-
-**Fix type:** Additive (new `parseStatus` field + UI treatment). The extraction pipeline itself already falls through gracefully; what is missing is the failure state propagation into the data model and UI.
+**Fix type:** All additive. New fields on `TrackedItem` (or a new `alerts` key
+for idempotency keys), new checks in `shouldTriggerNotification`, and a quiet-
+hours accumulation mechanism in `processNotifications`.
 
 ---
 
-## 4. RISK REGISTER
+### d. Failing closed when extraction breaks, rather than showing a stale price
 
-### R1 — `setTimeout` used for inter-request stagger inside the service worker
+**Partially done. The price is not updated on failure, but the failure is not
+surfaced distinctly until it is already severe.**
+
+**What currently happens on extraction failure:**
+
+1. `checkItem` returns `{ status: 'error' }` or `{ status: 'blocked' }`.
+2. `applyCheckResult` increments `consecutiveFailures`. Sets `lastCheckedAt`.
+3. `currentPrice` is **not updated** — the last good price is preserved.
+4. After ≥ 5 failures, `logger.error` is called. `TrackedItemCard` shows `⚠ Needs attention` via the `consecutiveFailures ≥ 5` check (`TrackedItemCard.tsx:49`).
+
+**What is missing:**
+
+1. **No `parseStatus` field.** There is no machine-readable reason code on
+   `TrackedItem` to distinguish: `ok`, `error`, `blocked`, `paused-by-user`.
+   The UI cannot render "this site blocks background checks" vs "selector broke"
+   vs "network timeout" vs "user paused".
+
+2. **Failures 1–4 are invisible to the user.** The item card looks identical
+   to a healthy item. `consecutiveFailures` is in storage but not surfaced until
+   it hits 5.
+
+3. **`blocked` and `error` are treated identically** by `applyCheckResult` —
+   both increment `consecutiveFailures` with no distinction stored.
+
+4. **No per-item `parseStatus` means the dashboard cannot filter by it.** Phase
+   3 needs to filter by "paused due to extraction failure" as a first-class state.
+
+5. **`lastCheckedAt` is updated on every check attempt, including failures.**
+   A user looking at "Last checked: 2h ago" cannot tell if that check succeeded
+   or failed. `lastSuccessfulParseAt` does not exist.
+
+**Fix type:** Additive. New fields `parseStatus`, `parseStatusReason`,
+`lastSuccessfulParseAt` on the entity. Small changes to `applyCheckResult` and
+`TrackedItemCard`.
+
+---
+
+### e. A full-page dashboard, as opposed to the popup
+
+**Fully blocked by architecture — no dashboard exists at all.**
+
+Current state:
+- One HTML page: `src/popup/index.html`, loaded as the extension popup.
+- All item display is in `src/popup/App.tsx`, a cramped popup-sized component.
+- The popup has no route to a full page.
+- There is no `dashboard.html`, no `src/dashboard/` directory, no
+  `chrome.action.openPopup()` → dashboard navigation.
+- The options page (`src/options/index.html`) exists but handles settings only.
+
+What is needed for Phase 3:
+- New entry point: `src/dashboard/index.html` + `App.tsx` + `main.tsx`
+- Registered in `manifest.json` (as `chrome_url_overrides` or a plain
+  `web_accessible_resource` opened via `chrome.tabs.create`)
+- New Vite entry point in `vite.config.ts`
+- `idx` storage key (Phase 1b) to power the list view with one read
+- Virtual row rendering (the popup's current item list is not virtualized)
+
+**Fix type:** Additive (new files, new manifest entry, no changes to existing
+popup code required). Depends on Phase 1b sharded storage.
+
+---
+
+## 5. Risk register
+
+### R1 — `void chrome.alarms.create(...)` silently discards alarm creation failure
+**File:** `src/background/scheduler.ts:15`
+**Severity:** High
+
+```typescript
+void chrome.alarms.create(ALARM_NAME, { delayInMinutes: 1, periodInMinutes: 30 });
+```
+
+`chrome.alarms.create` returns a `Promise<void>` in MV3. Errors (e.g. the
+browser's alarm limit exceeded) are silently discarded by `void`. If alarm
+creation fails, price checking never runs and the user receives no indication.
+The `void` was added to satisfy the no-floating-promises lint rule, but the
+correct fix is `.catch(err => logger.error(...))`.
+
+---
+
+### R2 — Event listeners registered synchronously at top level ✓ / one exception
+**File:** `src/background/index.ts`
+**Severity:** Low (one edge case)
+
+The four listener groups are all registered synchronously at module evaluation
+time — correct MV3 practice. However, `handleNotificationClick` calls
+`getAllItems()` (an async storage read) *inside* the `onClicked` handler before
+creating a tab. If the service worker is evicted between the notification being
+clicked and the tab being created, the tab open succeeds (Chrome re-wakes the
+SW for the event), but the `getAllItems` call starts fresh — this is fine since
+it reads from storage, not from memory. No actual risk here, but worth noting.
+
+---
+
+### R3 — Single-blob storage: every write rewrites every item
+**File:** `src/lib/storage.ts:142`
+**Severity:** High (performance, not correctness)
+
+`loadSchema() → mutate one field → saveSchema()` is the pattern for every
+public storage function. After a 10-item check pass followed by notification
+marking, the service worker performs 20+ full-blob serialize/deserialize cycles.
+At 100 dense-history items this is ~1.8 MB per cycle. No data is lost, but the
+event loop is blocked and the total execution time grows toward the SW timeout.
+This is the primary motivation for the sharded key layout in Phase 1b.
+
+---
+
+### R4 — `setTimeout` used for inter-request stagger inside the service worker
 **File:** `src/background/checker.ts:149`
 **Severity:** Medium
 
@@ -261,157 +504,97 @@ What is missing:
 await new Promise<void>((resolve) => setTimeout(resolve, delay));
 ```
 
-Used to stagger requests between items in a single alarm pass. Chrome's MV3 service worker has a ~30 s idle timeout (extended to ~5 min when a fetch or alarm is in progress). With 10 items × up to 15 s each + 8 s jitter between each, worst case is ~(15+8)×10 = 230 s. This exceeds 30 s idle and is close to the extended limit. If Chrome kills the worker mid-pass, remaining items are skipped until the next alarm fires 30 minutes later. This is not catastrophic — it just means some items miss a pass. But it is a real risk under memory pressure.
-
-The `setTimeout` itself is acceptable here (sub-minute, within a single event handler), but the total pass duration is the actual concern.
-
----
-
-### R2 — Single-blob load-modify-save is not atomic
-**File:** `src/lib/storage.ts:142-146`
-**Severity:** Medium
-
-Every public storage function does `loadSchema() → mutate → saveSchema()`. The alarm handler calls `saveItem` for each checked item sequentially; `processNotifications` calls `saveItem` again for each notified item. These are sequential awaits in the same event loop, so interleaving within one alarm pass is not possible. However, if a popup write (save new item, pause item) races with an alarm-triggered save, one write silently clobbers the other. `chrome.storage.local` provides no transactions. The single-blob design maximises this risk surface.
+Used to stagger requests within a single alarm handler invocation. This is
+technically acceptable (the SW is kept alive by an ongoing event handler), but
+the total pass duration can reach (15 s fetch timeout + 8 s jitter) × 10 items
+= 230 s. Chrome's SW extended timeout (while a fetch or alarm event is active)
+is not publicly documented and has been observed to vary. If Chrome kills the
+worker mid-pass, remaining items are silently skipped until the next alarm.
+No data is corrupted, but checks are missed. The fix (Phase 4) is to make the
+pass resumable by persisting a cursor.
 
 ---
 
-### R3 — Generic adapter returns `method: 'adapter'`
+### R5 — `generic.ts` returns `method: 'adapter'` — wrong tier identifier
 **File:** `src/content/extract/adapters/generic.ts:111`
+**Severity:** High
+
+The generic DOM heuristic returns `{ method: 'adapter' }`. All stored items
+where the generic heuristic ran show `extractionMethod: 'adapter'` — identical
+to Amazon and eBay dedicated adapters. Any future logic that gates behaviour on
+extraction tier (Phase 4: "never alert on Tier 3") cannot identify generic-
+heuristic items. A misidentified DOM node becomes an alert-eligible observation.
+
+---
+
+### R6 — Notification double-send on service worker restart mid-pass
+**File:** `src/background/notifier.ts:17`
 **Severity:** Medium
 
-Returns `{ method: 'adapter' }` instead of a distinct value (e.g. `'generic'`). Any future code that gates behaviour on `extractionMethod` — such as "require user confirmation before notifying if method is generic-heuristic" — cannot identify these items. They are stored identically to Amazon/eBay adapter results.
+`processNotifications()` reads all items, identifies triggered items, sends
+notifications, then marks items as notified — three separate storage operations.
+If the service worker is evicted between sending and marking, the next alarm
+fires `processNotifications()` again, finds the same items still unnotified
+(because `lastNotifiedAt` was never written), and sends duplicate notifications.
+The 24-hour cooldown only prevents recurrence after the mark is written.
 
 ---
 
-### R4 — `parsePrice` cannot handle "Free", "See price in cart", or empty string without erroring
-**File:** `src/lib/money.ts:61-86`
-**Severity:** Medium
+### R7 — `SparklineChart` draws straight lines through observation gaps
+**File:** `src/popup/components/SparklineChart.tsx:30`
+**Severity:** Medium (correctness, user trust)
 
-`parsePrice("")` → `err('Empty or invalid price input')`. `parsePrice("Free")` → stripped of symbols → `""` → `err(...)`. `parsePrice("See price in cart")` → stripped → `NaN` → `err(...)`. These are all handled gracefully (returns `err`, never crashes). The risk is that an extraction strategy that finds one of these strings as the price element returns `null`, the engine falls through to the next strategy, which may find a *different* number (e.g. a related-product price) and report it with medium confidence. The caller cannot distinguish "no price found" from "wrong price found" — both look like a successful extraction at lower confidence.
-
----
-
-### R5 — `void chrome.alarms.create(...)` silently swallows alarm creation failure
-**File:** `src/background/scheduler.ts:15`
-**Severity:** Low
-
-`void chrome.alarms.create(ALARM_NAME, {...})` — errors (e.g. exceeding Chrome's alarm limit) are silently discarded. If alarm creation fails, price checking never runs and the user receives no indication.
-
----
-
-### R6 — `perSiteEnabled` and `recentlyNotifiedItemIds` are dead schema fields
-**Files:** `src/lib/storage.ts:16`, `src/background/notifier.ts:66-70`
-**Severity:** Low
-
-`AppSettings.perSiteEnabled` is stored and settable in options but never read by the checker. `NotificationState.recentlyNotifiedItemIds` is appended to on every notification pass (capped at 50) but never queried. Both write to storage on every cycle for no effect. They bloat the blob and add writer noise.
-
----
-
-### R7 — `chrome.alarms.create` voided in scheduler; failure invisible
-**File:** `src/background/scheduler.ts:15`
-**Severity:** Low
-
-Already noted above as R5. Separately: `setupAlarm` is called with `void` at the call sites (`index.ts:15, 20`), so even if `setupAlarm` propagated an error, the caller would not see it.
-
----
-
-### R8 — Two-phase content script injection has a TOCTOU gap
-**File:** `src/popup/App.tsx:66-90`
-**Severity:** Low
-
-If the user navigates the active tab between the `executeScript({ files })` call and the `executeScript({ func })` retrieval call, the retrieval reads `undefined` from the new page's isolated world, `setDetectedProduct(null)` is called silently, and the manual-price fallback appears with no explanation.
-
----
-
-### R9 — Timestamps are epoch ms in storage; constraint says ISO 8601
-**File:** `src/types/index.ts:10,27-30`
-**Severity:** Low (internal inconsistency only)
-
-`CLAUDE.md` engineering constraints say "All timestamps are UTC ISO 8601." The data model stores all timestamps as `number` (epoch ms). Epoch ms is correct for arithmetic (sorting, age calculations); ISO 8601 would be correct for human-readable export. The inconsistency is between the constraint document and the implementation, not within the code itself.
-
----
-
-## 5. STORAGE BUDGET
-
-### Per-item size breakdown
-
-**Base overhead per `TrackedItem` (no history):**
-
-| Field | Typical bytes (JSON) |
-|---|---|
-| id (UUID string) | 38 |
-| url | 50–120 |
-| title | 60–250 |
-| imageUrl | 80–150 (or 4 for null) |
-| hostname | 15–25 |
-| currency | 5 |
-| initialPrice + currentPrice | ~90 total |
-| targetPrice | 4 (null) or ~45 |
-| history: [] | 2 |
-| createdAt, lastCheckedAt, lastNotifiedAt | ~42 |
-| lastNotifiedPriceMinor | 4–10 |
-| consecutiveFailures | 3 |
-| paused | 5 |
-| extractionMethod | 12–15 |
-| JSON key names (overhead) | ~180 |
-| **Base total** | **~600–900 bytes** |
-
-**Per `PricePoint`:**
-```json
-{"price":{"amountMinor":9999,"currency":"USD"},"observedAt":1722000000000,"inStock":true}
+```typescript
+const x = padding + (i / (prices.length - 1)) * plotWidth;
 ```
-≈ **85 bytes** per point.
 
-**Per-item totals by history depth:**
-
-| History points | Item size |
-|---|---|
-| 0 | ~750 B |
-| 50 | ~5.0 KB |
-| 100 | ~9.2 KB |
-| 200 (current cap) | ~17.8 KB |
-
-**Note:** History grows only on price *changes*, not every poll. A product polled every 6 hours that changes price weekly accumulates ~52 observations per year. At 2 years: ~104 points = ~9.6 KB.
+X position is computed by *index*, not by `observedAt` timestamp. Two observations
+one week apart are drawn the same distance as two observations one hour apart.
+The plan explicitly requires "render gaps as gaps rather than interpolating a
+straight line through days we never observed, because a smooth line through
+missing data is a lie."
 
 ---
 
-### At 100 watched products
+### R8 — `recentlyNotifiedItemIds` and `perSiteEnabled` are dead schema fields
+**Files:** `src/background/notifier.ts:66`, `src/types/index.ts:57`
+**Severity:** Low
 
-| Scenario | Total size |
-|---|---|
-| Sparse history (avg 25 pts/item) | ~295 KB |
-| Moderate (avg 75 pts/item) | ~690 KB |
-| Dense (200 pts/item — volatile prices) | ~1.8 MB |
-
-Well within Chrome's 10 MB `chrome.storage.local` limit. The 5 MB soft guard in `storage.ts:10` will not trigger.
-
-**Performance concern at 100 items:** Every `saveItem` call reads and writes the entire blob (~300 KB–1.8 MB). At the end of a 10-item check pass + notifications, that is 20+ full-blob read-write cycles. Still fast enough in practice.
+`NotificationState.recentlyNotifiedItemIds` is appended to on every notification
+pass (capped at 50 in `notifier.ts:70`) but never read for any purpose.
+`AppSettings.perSiteEnabled` is stored and defaulted but never consulted by the
+checker. Both write to storage on every cycle for no effect and bloat the blob.
 
 ---
 
-### At 500 watched products
+### R9 — `parsePrice` correctly rejects "Free" / "See price in cart" / "" but the fallback may find a wrong price
+**File:** `src/lib/money.ts:61`, `src/content/extract/index.ts:28`
+**Severity:** Medium
 
-| Scenario | Total size |
-|---|---|
-| Sparse history (avg 25 pts/item) | ~1.45 MB |
-| Moderate (avg 75 pts/item) | ~3.45 MB |
-| Dense (200 pts/item) | ~8.9 MB |
+`parsePrice("")` → `err`. `parsePrice("Free")` → stripped → `err`.
+`parsePrice("See price in cart")` → stripped → `NaN` → `err`. These all return
+`err` correctly and the extractor returns `null`.
 
-The **dense case approaches Chrome's 10 MB limit.** The current 5 MB soft guard fires at roughly 280 fully-loaded items with 200-point histories, which is too conservative — it blocks saves before the Chrome limit is reached but at an arbitrary threshold.
-
-More critically: at 500 items, every single `saveItem` call serialises and deserialises a blob of 1.5–9 MB. The 30-item batch at the end of a check pass + notification round becomes a serious performance problem. This is the primary motivation for splitting the single blob into per-item keys in Phase 1.
-
-**`unlimitedStorage` permission:** Not needed at 100 items. At 500 dense items the 10 MB limit could be breached. The Phase 1 spec correctly defers this decision until the new schema's byte projections are known.
+The risk is the fallback chain. If the page's primary price element contains
+"See price in cart", JSON-LD fails, and the generic heuristic finds a *different*
+number (a related-product price, a shipping cost, a sold-count) and returns it
+at confidence 0.40 as a plausible price. The caller cannot distinguish "no price
+found on this page" from "wrong element found". Confidence 0.40 should always
+require a sanity guard before storage — Phase 1b adds this.
 
 ---
 
-### StorageSchema overhead (non-item fields)
+### R10 — Load-modify-save is not atomic; concurrent popup + alarm writes can clobber
+**File:** `src/lib/storage.ts:142`
+**Severity:** Low (rare in practice, not catastrophic)
 
-| Field | Size |
-|---|---|
-| schemaVersion | ~20 B |
-| settings | ~120 B |
-| notifications (50 UUID strings) | ~1.8 KB |
-| **Total overhead** | **~2 KB** |
+A user saving a new item in the popup while the alarm handler is mid-pass can
+interleave: both read the same blob, both mutate different items, one write
+overwrites the other. In practice the alarm pass is sequential and the popup save
+is a single user action, so the window is small. No data is permanently
+corrupted — the next write restores the missing field. But it can cause a save
+to silently vanish.
 
-Negligible.
+---
+
+*No questions for you. Everything above is directly observable from the code.*

@@ -6,6 +6,7 @@ import {
   isLessThan,
   priceDifferencePercent,
   getMinorUnitMultiplier,
+  normalizeMoney,
 } from '../../src/lib/money.js';
 
 describe('parsePrice', () => {
@@ -224,5 +225,122 @@ describe('getMinorUnitMultiplier', () => {
 
   it('returns 1000 for KWD', () => {
     expect(getMinorUnitMultiplier('KWD')).toBe(1000);
+  });
+});
+
+describe('normalizeMoney', () => {
+  it('normalizes $1,299.00', () => {
+    const result = normalizeMoney('$1,299.00', 'USD');
+    expect(result).not.toBeNull();
+    expect(result?.amountMinor).toBe(129900);
+    expect(result?.currency).toBe('USD');
+  });
+
+  it('normalizes 1.299,00 EUR', () => {
+    const result = normalizeMoney('1.299,00 EUR', 'EUR');
+    expect(result).not.toBeNull();
+    expect(result?.amountMinor).toBe(129900);
+    expect(result?.currency).toBe('EUR');
+  });
+
+  it('normalizes $19.99', () => {
+    const result = normalizeMoney('$19.99', 'USD');
+    expect(result).not.toBeNull();
+    expect(result?.amountMinor).toBe(1999);
+    expect(result?.currency).toBe('USD');
+  });
+
+  it('normalizes €49,99', () => {
+    const result = normalizeMoney('€49,99', 'EUR');
+    expect(result).not.toBeNull();
+    expect(result?.amountMinor).toBe(4999);
+    expect(result?.currency).toBe('EUR');
+  });
+
+  it('normalizes £99.99', () => {
+    const result = normalizeMoney('£99.99', 'GBP');
+    expect(result).not.toBeNull();
+    expect(result?.amountMinor).toBe(9999);
+    expect(result?.currency).toBe('GBP');
+  });
+
+  it('normalizes ¥1,980', () => {
+    const result = normalizeMoney('¥1,980', 'JPY');
+    expect(result).not.toBeNull();
+    expect(result?.amountMinor).toBe(1980);
+    expect(result?.currency).toBe('JPY');
+  });
+
+  it('normalizes ₹4,999', () => {
+    const result = normalizeMoney('₹4,999', 'INR');
+    expect(result).not.toBeNull();
+    expect(result?.amountMinor).toBe(499900);
+    expect(result?.currency).toBe('INR');
+  });
+
+  it('normalizes 0', () => {
+    const result = normalizeMoney('0', 'USD');
+    expect(result).not.toBeNull();
+    expect(result?.amountMinor).toBe(0);
+  });
+
+  it('normalizes $0.00', () => {
+    const result = normalizeMoney('$0.00', 'USD');
+    expect(result).not.toBeNull();
+    expect(result?.amountMinor).toBe(0);
+  });
+
+  it('takes lower end of price range $10.99 - $15.99', () => {
+    const result = normalizeMoney('$10.99 - $15.99', 'USD');
+    expect(result).not.toBeNull();
+    expect(result?.amountMinor).toBe(1099);
+    expect(result?.currency).toBe('USD');
+  });
+
+  it('returns null for Free', () => {
+    expect(normalizeMoney('Free', 'USD')).toBeNull();
+  });
+
+  it('returns null for free (lowercase)', () => {
+    expect(normalizeMoney('free', 'USD')).toBeNull();
+  });
+
+  it('returns null for FREE (uppercase)', () => {
+    expect(normalizeMoney('FREE', 'USD')).toBeNull();
+  });
+
+  it('returns null for See price in cart', () => {
+    expect(normalizeMoney('See price in cart', 'USD')).toBeNull();
+  });
+
+  it('returns null for empty string', () => {
+    expect(normalizeMoney('', 'USD')).toBeNull();
+  });
+
+  it('returns null for null input', () => {
+    expect(normalizeMoney(null, 'USD')).toBeNull();
+  });
+
+  it('returns null for undefined input', () => {
+    expect(normalizeMoney(undefined, 'USD')).toBeNull();
+  });
+
+  it('returns null for numeric input', () => {
+    expect(normalizeMoney(42, 'USD')).toBeNull();
+  });
+
+  it('returns null for Sign in to see price', () => {
+    expect(normalizeMoney('Sign in to see price', 'USD')).toBeNull();
+  });
+
+  it('returns null for Unavailable', () => {
+    expect(normalizeMoney('Unavailable', 'USD')).toBeNull();
+  });
+
+  it('normalizes 1 234,56 with EUR context', () => {
+    const result = normalizeMoney('1 234,56', 'EUR');
+    expect(result).not.toBeNull();
+    expect(result?.amountMinor).toBe(123456);
+    expect(result?.currency).toBe('EUR');
   });
 });

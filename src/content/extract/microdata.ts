@@ -1,6 +1,8 @@
 import type { ExtractedProduct } from '../../types/index.js';
 import { parsePrice } from '../../lib/money.js';
 import { createLogger } from '../../lib/logger.js';
+import { parseStockState, stockStateToInStock } from './stockstate.js';
+import { extractListPrice } from './listprice.js';
 
 const logger = createLogger('extract:microdata');
 
@@ -79,10 +81,30 @@ export function extractFromMicrodata(document: Document): ExtractedProduct | nul
     availabilityEl?.textContent?.trim() ??
     '';
 
-  const inStock =
-    !availabilityStr ||
-    availabilityStr.includes('InStock') ||
-    availabilityStr.includes('in stock');
+  const stockState = parseStockState(availabilityStr);
+  const inStock = stockStateToInStock(stockState);
+
+  // Advertised list price: check highPrice itemprop (AggregateOffer), then DOM fallback
+  let advertisedListPrice = null;
+  const highPriceEl = offersScope
+    ? getItemprop(offersScope, 'highPrice')
+    : getItemprop(scope, 'highPrice');
+
+  if (highPriceEl) {
+    const highPriceStr =
+      highPriceEl.getAttribute('content') ?? highPriceEl.textContent?.trim() ?? '';
+    if (highPriceStr) {
+      const highResult = parsePrice(highPriceStr, result.value.currency);
+      if (highResult.ok && highResult.value.amountMinor > result.value.amountMinor) {
+        advertisedListPrice = highResult.value;
+      }
+    }
+  }
+
+  // DOM fallback for list price
+  if (!advertisedListPrice) {
+    advertisedListPrice = extractListPrice(document, result.value.amountMinor, result.value.currency);
+  }
 
   return {
     title: titleStr,
@@ -90,7 +112,9 @@ export function extractFromMicrodata(document: Document): ExtractedProduct | nul
     imageUrl,
     currency: result.value.currency,
     inStock,
+    advertisedListPrice,
     confidence: 0.8,
     method: 'microdata',
+    stockState,
   };
 }

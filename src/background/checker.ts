@@ -1,266 +1,317 @@
-import type { TrackedItem, ExtractedProduct, CheckResult } from '../types/index.js';
-import { getAllItems, saveItem, getSettings } from '../lib/storage.js';
-import { addPricePoint } from '../lib/history.js';
-import { isLessThan, sameCurrency } from '../lib/money.js';
+import type { Product, Observation, ObservationHistory, StockStateCode, ParseTier, ParseStatus } from '../types/storage.js';
+import type { ExtractedProduct, CheckResult } from '../types/index.js';
+import {
+  getProductIndex, getProduct, getHistory, getSettings,
+  appendObservation, updateProduct,
+} from '../lib/storage.js';
+import { sameCurrency } from '../lib/money.js';
 import { isDueForCheck, staggerDelayMs } from '../lib/backoff.js';
-import { extractProduct } from '../content/extract/index.js';
+import { sanityCheckObservation } from '../lib/sanity.js';
+import { extractProductAsync } from '../content/extract/index.js';
 import { createLogger } from '../lib/logger.js';
+import { getHostBackoff, recordHostSuccess, recordHostFailure, isHostPaused } from '../lib/hostbackoff.js';
+import { sendRestockNotification } from './notifier.js';
 
 const logger = createLogger('checker');
-
 const MAX_ITEMS_PER_PASS = 10;
 const FETCH_TIMEOUT_MS = 15000;
 const MAX_CONSECUTIVE_FAILURES = 5;
 
-/**
- * Fetch a URL with timeout and parse with DOMParser.
- */
+function methodToTier(method: ExtractedProduct['method']): ParseTier {
+  if (method === 'adapter' || method === 'shopify' || method === 'woocommerce') return 2;
+  if (method === 'generic') return 3;
+  return 1;
+}
+
+function toStockState(product: ExtractedProduct): StockStateCode {
+  if (product.stockState !== undefined) return product.stockState;
+  return product.inStock ? 1 : 2;
+}
+
 async function fetchAndParse(url: string): Promise<Document> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
   try {
     const response = await fetch(url, {
       signal: controller.signal,
       headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0',
         Accept: 'text/html,application/xhtml+xml',
         'Accept-Language': 'en-US,en;q=0.9',
       },
       credentials: 'omit',
     });
-
     clearTimeout(timer);
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-
-    const html = await response.text();
-    const parser = new DOMParser();
-    return parser.parseFromString(html, 'text/html');
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return new DOMParser().parseFromString(await response.text(), 'text/html');
   } catch (e) {
     clearTimeout(timer);
     throw e;
   }
 }
 
-/**
- * Check if a response looks blocked (200 but no useful content).
- */
 function isBlockedResponse(doc: Document, extracted: ExtractedProduct | null): boolean {
-  if (!extracted) {
-    // Check for bot detection pages
-    const bodyText = doc.body?.textContent?.toLowerCase() ?? '';
-    return (
-      bodyText.includes('access denied') ||
-      bodyText.includes('robot') ||
-      bodyText.includes('captcha') ||
-      bodyText.includes('blocked') ||
-      doc.title.toLowerCase().includes('access denied') ||
-      doc.title.toLowerCase().includes('robot check')
-    );
-  }
-  return false;
+  if (extracted) return false;
+  const body = doc.body?.textContent?.toLowerCase() ?? '';
+  return body.includes('access denied') || body.includes('robot') || body.includes('captcha') ||
+    body.includes('blocked') || doc.title.toLowerCase().includes('access denied');
 }
 
-/**
- * Run a single check on a tracked item.
- */
-async function checkItem(item: TrackedItem): Promise<CheckResult> {
+async function checkProduct(product: Product): Promise<CheckResult> {
   let doc: Document;
-
   try {
-    doc = await fetchAndParse(item.url);
+    doc = await fetchAndParse(product.url);
   } catch (e) {
-    const message = e instanceof Error ? e.message : String(e);
-    logger.warn('Fetch failed', { url: item.url, error: message });
-    return { status: 'error', message };
+    return { status: 'error', message: e instanceof Error ? e.message : String(e) };
   }
-
-  const extracted = extractProduct(doc, item.hostname);
-
-  if (isBlockedResponse(doc, extracted)) {
-    logger.warn('Site appears to be blocking requests', { hostname: item.hostname });
-    return { status: 'blocked' };
-  }
-
-  if (!extracted) {
-    return { status: 'error', message: 'Could not extract price from page' };
-  }
-
-  // Currency mismatch check
-  if (!sameCurrency(extracted.price, item.currentPrice)) {
-    logger.warn('Currency mismatch detected', {
-      expected: item.currency,
-      got: extracted.price.currency,
-    });
+  const extracted = await extractProductAsync(doc, product.retailerHost, product.url);
+  if (isBlockedResponse(doc, extracted)) return { status: 'blocked' };
+  if (!extracted) return { status: 'error', message: 'Could not extract price' };
+  if (!sameCurrency(extracted.price, { amountMinor: product.currentPrice, currency: product.currency })) {
     return { status: 'error', message: `Currency changed: ${extracted.price.currency}` };
   }
-
   return { status: 'ok', product: extracted };
 }
 
-/**
- * Run a price check pass over due items.
- * At most MAX_ITEMS_PER_PASS items, staggered by hostname.
- */
 export async function runCheckPass(): Promise<void> {
-  logger.info('Starting check pass');
-
-  const settings = await getSettings();
-  const allItems = await getAllItems();
-  const checkIntervalMs = settings.checkIntervalHours * 60 * 60 * 1000;
-  const now = Date.now();
-
-  // Filter items due for checking
-  const dueItems = Object.values(allItems)
-    .filter(
-      (item) =>
-        !item.paused &&
-        isDueForCheck(item.lastCheckedAt, item.consecutiveFailures, checkIntervalMs, now),
-    )
-    .slice(0, MAX_ITEMS_PER_PASS);
-
-  if (dueItems.length === 0) {
-    logger.info('No items due for checking');
+  // Skip entire pass if offline
+  if (!(navigator as Navigator & { onLine: boolean }).onLine) {
+    logger.info('Skipping check pass: offline');
     return;
   }
 
-  logger.info(`Checking ${dueItems.length} items`);
+  logger.info('Starting check pass');
+  const settings = await getSettings();
+  const allSummaries = await getProductIndex();
+  const checkIntervalMs = settings.checkIntervalHours * 60 * 60 * 1000;
+  const now = Date.now();
 
-  // Group by hostname to avoid parallel requests to same host
-  const byHostname = new Map<string, TrackedItem[]>();
-  for (const item of dueItems) {
-    const group = byHostname.get(item.hostname) ?? [];
-    group.push(item);
-    byHostname.set(item.hostname, group);
-  }
+  const due = allSummaries
+    .filter((s) => s.parseStatus !== 'paused' && isDueForCheck(s.lastCheckedAt, 0, checkIntervalMs, now))
+    .slice(0, MAX_ITEMS_PER_PASS);
 
-  // Process sequentially with stagger
-  const processedItemIds: string[] = [];
+  if (due.length === 0) { logger.info('No items due'); return; }
 
-  for (const [hostname, items] of byHostname) {
-    for (const item of items) {
-      if (processedItemIds.length > 0) {
-        // Stagger delay between requests
-        const delay = staggerDelayMs();
-        await new Promise<void>((resolve) => setTimeout(resolve, delay));
-      }
+  const hostBackoffState = await getHostBackoff();
 
-      logger.debug('Checking item', { id: item.id, url: item.url });
+  for (let i = 0; i < due.length; i++) {
+    if (i > 0) await new Promise<void>((resolve) => setTimeout(resolve, staggerDelayMs()));
+    const summary = due[i];
+    if (!summary) continue;
 
-      const result = await checkItem(item);
-      const updatedItem = applyCheckResult(item, result, now);
-
-      const saveResult = await saveItem(updatedItem);
-      if (!saveResult.ok) {
-        logger.error('Failed to save item after check', { id: item.id, error: saveResult.error });
-      }
-
-      processedItemIds.push(item.id);
+    // Per-host backoff check
+    let hostname: string;
+    try {
+      hostname = new URL(summary.url).hostname;
+    } catch {
+      hostname = summary.retailerHost;
     }
 
-    void hostname; // used in map key
-  }
+    if (isHostPaused(hostBackoffState, hostname)) {
+      logger.info('Skipping product: host paused', { id: summary.id, hostname });
+      continue;
+    }
 
-  logger.info('Check pass complete', { processed: processedItemIds.length });
+    const product = await getProduct(summary.id);
+    if (!product) continue;
+    const result = await checkProduct(product);
+    const nowMs = Date.now();
+
+    // Track per-host failures
+    if (result.status === 'blocked' || result.status === 'error') {
+      await recordHostFailure(hostname);
+      // Refresh state for subsequent iterations in this pass
+      const refreshed = await getHostBackoff();
+      hostBackoffState.failures = refreshed.failures;
+      hostBackoffState.pausedUntil = refreshed.pausedUntil;
+    } else if (result.status === 'ok') {
+      await recordHostSuccess(hostname);
+    }
+
+    switch (result.status) {
+      case 'ok': {
+        const newPriceMinor = result.product.price.amountMinor;
+        const tier = methodToTier(result.product.method);
+        const stockState = toStockState(result.product);
+        const priceChanged = newPriceMinor !== product.currentPrice;
+        const restocked = product.stockState !== 1 && stockState === 1;
+
+        const base: Product = {
+          ...product,
+          currentPrice: newPriceMinor,
+          lastKnownStockState: product.stockState,  // snapshot before update
+          stockState,
+          parseTier: tier,
+          parseStatus: 'ok',
+          consecutiveFailures: 0,
+          lastCheckedAt: nowMs,
+          lastSuccessfulParseAt: nowMs,
+        };
+
+        if (priceChanged) {
+          const history = await getHistory(product.id);
+          if (!sanityCheckObservation(newPriceMinor, history?.obs ?? [])) {
+            logger.warn('Sanity check failed', { id: product.id, price: newPriceMinor });
+            await updateProduct(base);
+            break;
+          }
+          const obs: Observation = [
+            Math.floor(nowMs / 60_000), newPriceMinor,
+            result.product.advertisedListPrice?.amountMinor ?? 0,
+            stockState, tier,
+          ];
+          await appendObservation(product.id, obs);
+        } else {
+          await updateProduct(base);
+        }
+
+        // Restock notification: item just came back in stock and user opted in
+        if (restocked && base.watch.notifyOnRestock) {
+          logger.info('Restock detected', { id: base.id, title: base.title });
+          await sendRestockNotification(base);
+        }
+        break;
+      }
+      case 'blocked': {
+        const failures = product.consecutiveFailures + 1;
+        const parseStatus: ParseStatus = failures >= MAX_CONSECUTIVE_FAILURES ? 'paused' : 'blocked';
+        await updateProduct({ ...product, parseStatus, consecutiveFailures: failures, lastCheckedAt: nowMs });
+        break;
+      }
+      case 'error': {
+        const failures = product.consecutiveFailures + 1;
+        const parseStatus: ParseStatus = failures >= MAX_CONSECUTIVE_FAILURES ? 'paused' : product.parseStatus;
+        logger.warn('Check error', { id: product.id, error: result.message, failures });
+        await updateProduct({ ...product, parseStatus, consecutiveFailures: failures, lastCheckedAt: nowMs });
+        break;
+      }
+      case 'unchanged':
+        break;
+    }
+  }
+  logger.info('Check pass done', { checked: due.length });
 }
 
 /**
- * Apply a check result to an item and return the updated item.
+ * Force-check a single product by ID, bypassing the "due for check" filter.
+ * Used by the "Refresh" button in the UI.
  */
-export function applyCheckResult(
-  item: TrackedItem,
-  result: CheckResult,
-  now: number = Date.now(),
-): TrackedItem {
-  const updated: TrackedItem = { ...item, lastCheckedAt: now };
+export async function checkProductNow(productId: string): Promise<Product | null> {
+  const product = await getProduct(productId);
+  if (!product) return null;
+
+  let hostname: string;
+  try { hostname = new URL(product.url).hostname; } catch { hostname = product.retailerHost; }
+
+  const result = await checkProduct(product);
+  const nowMs = Date.now();
+
+  if (result.status === 'blocked' || result.status === 'error') {
+    await recordHostFailure(hostname);
+  } else if (result.status === 'ok') {
+    await recordHostSuccess(hostname);
+  }
 
   switch (result.status) {
     case 'ok': {
-      const newPrice = result.product.price;
-      const priceChanged = newPrice.amountMinor !== item.currentPrice.amountMinor;
+      const newPriceMinor = result.product.price.amountMinor;
+      const tier = methodToTier(result.product.method);
+      const stockState = toStockState(result.product);
+      const priceChanged = newPriceMinor !== product.currentPrice;
+      const restocked = product.stockState !== 1 && stockState === 1;
 
-      updated.currentPrice = newPrice;
-      updated.consecutiveFailures = 0;
+      const base: Product = {
+        ...product,
+        currentPrice: newPriceMinor,
+        lastKnownStockState: product.stockState,
+        stockState,
+        parseTier: tier,
+        parseStatus: 'ok',
+        consecutiveFailures: 0,
+        lastCheckedAt: nowMs,
+        lastSuccessfulParseAt: nowMs,
+      };
 
       if (priceChanged) {
-        updated.history = addPricePoint(item.history, {
-          price: newPrice,
-          observedAt: now,
-          inStock: result.product.inStock,
-        });
+        const history = await getHistory(product.id);
+        if (sanityCheckObservation(newPriceMinor, history?.obs ?? [])) {
+          const obs: Observation = [
+            Math.floor(nowMs / 60_000), newPriceMinor,
+            result.product.advertisedListPrice?.amountMinor ?? 0,
+            stockState, tier,
+          ];
+          await appendObservation(product.id, obs);
+        } else {
+          await updateProduct(base);
+        }
+      } else {
+        await updateProduct(base);
       }
 
-      // Check if we should notify
-      const shouldNotify = shouldTriggerNotification(updated);
-      if (shouldNotify) {
-        logger.info('Price drop detected', {
-          id: item.id,
-          from: item.currentPrice.amountMinor,
-          to: newPrice.amountMinor,
-        });
+      if (restocked && base.watch.notifyOnRestock) {
+        await sendRestockNotification(base);
       }
 
-      break;
+      return await getProduct(productId);
     }
-
-    case 'error': {
-      updated.consecutiveFailures = item.consecutiveFailures + 1;
-      logger.warn('Check error', { id: item.id, failures: updated.consecutiveFailures });
-
-      if (updated.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-        logger.error('Item needs attention', { id: item.id });
-      }
-      break;
-    }
-
     case 'blocked': {
-      updated.consecutiveFailures = item.consecutiveFailures + 1;
-      break;
+      const failures = product.consecutiveFailures + 1;
+      const parseStatus: ParseStatus = failures >= MAX_CONSECUTIVE_FAILURES ? 'paused' : 'blocked';
+      await updateProduct({ ...product, parseStatus, consecutiveFailures: failures, lastCheckedAt: nowMs });
+      return await getProduct(productId);
     }
-
-    case 'unchanged': {
-      updated.consecutiveFailures = 0;
-      break;
+    case 'error': {
+      const failures = product.consecutiveFailures + 1;
+      const parseStatus: ParseStatus = failures >= MAX_CONSECUTIVE_FAILURES ? 'paused' : product.parseStatus;
+      logger.warn('Check error (now)', { id: product.id, error: result.message });
+      await updateProduct({ ...product, parseStatus, consecutiveFailures: failures, lastCheckedAt: nowMs });
+      return await getProduct(productId);
     }
+    default:
+      return product;
   }
-
-  return updated;
 }
 
 /**
- * Determine if a notification should be triggered for an item.
+ * Compute whether price is at or below the 90th-percentile low
+ * (i.e., in the cheapest 10% of observations) within the last 365 days.
  */
-export function shouldTriggerNotification(item: TrackedItem): boolean {
-  const cooldownMs = 24 * 60 * 60 * 1000; // 24 hours
+export function isAtPercentileLow(currentPrice: number, history: ObservationHistory): boolean {
+  const cutoffMs = Date.now() - 365 * 24 * 60 * 60 * 1000;
+  const prices = history.obs
+    .filter((o) => o[0] * 60_000 >= cutoffMs)
+    .map((o) => o[1])
+    .sort((a, b) => a - b);
+  if (prices.length === 0) return false;
+  const idx = Math.floor(0.10 * prices.length);
+  const p10 = prices[idx] ?? prices[0];
+  return currentPrice <= (p10 ?? Infinity);
+}
 
-  // Check cooldown
-  if (item.lastNotifiedAt !== null && Date.now() - item.lastNotifiedAt < cooldownMs) {
-    return false;
+export function shouldTriggerNotification(
+  product: Product,
+  history?: ObservationHistory,
+): boolean {
+  const { watch } = product;
+  if (watch.muted) return false;
+  if (product.parseTier >= 3) return false;
+  if (product.stockState === 2) return false;
+  if (watch.lastAlertedAt !== null) {
+    if (Date.now() - watch.lastAlertedAt < watch.cooldownHours * 60 * 60 * 1000) return false;
+  }
+  if (watch.lastAlertedPrice !== null) {
+    if (product.currentPrice >= watch.lastAlertedPrice * 0.97) return false;
+  }
+  if (watch.targetPrice !== null) return product.currentPrice <= watch.targetPrice;
+
+  // Drop threshold: trigger only when price drops by at least dropThresholdPct% from initial
+  if (watch.dropThresholdPct !== null) {
+    const threshold = product.initialPriceMinor * (1 - watch.dropThresholdPct / 100);
+    return product.currentPrice <= threshold;
   }
 
-  // Dedup: don't notify for same or higher price as last notification
-  if (
-    item.lastNotifiedPriceMinor !== null &&
-    item.currentPrice.amountMinor >= item.lastNotifiedPriceMinor
-  ) {
-    return false;
-  }
-
-  // Check trigger condition
-  if (item.targetPrice !== null) {
-    return (
-      sameCurrency(item.currentPrice, item.targetPrice) &&
-      isLessThan(item.currentPrice, item.targetPrice)
-    );
-  }
-
-  // Default: any drop below initial price
-  return (
-    sameCurrency(item.currentPrice, item.initialPrice) &&
-    isLessThan(item.currentPrice, item.initialPrice)
-  );
+  // No target or threshold: trigger if below initial price OR at 90th-percentile low
+  if (product.currentPrice < product.initialPriceMinor) return true;
+  if (history !== undefined && isAtPercentileLow(product.currentPrice, history)) return true;
+  return false;
 }

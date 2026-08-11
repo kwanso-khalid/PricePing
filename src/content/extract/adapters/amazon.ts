@@ -1,6 +1,7 @@
 import type { ExtractedProduct } from '../../../types/index.js';
 import { parsePrice } from '../../../lib/money.js';
 import { createLogger } from '../../../lib/logger.js';
+import { parseStockState, stockStateToInStock } from '../stockstate.js';
 
 const logger = createLogger('adapter:amazon');
 
@@ -70,11 +71,33 @@ export function extractFromAmazon(document: Document): ExtractedProduct | null {
 
   // Availability
   const availabilityEl = document.querySelector('#availability span');
-  const availabilityText = availabilityEl?.textContent?.trim()?.toLowerCase() ?? '';
-  const inStock =
-    !availabilityText ||
-    availabilityText.includes('in stock') ||
-    availabilityText.includes('in stock soon');
+  const availabilityText = availabilityEl?.textContent?.trim() ?? '';
+  const stockState = parseStockState(availabilityText);
+  const inStock = stockStateToInStock(stockState);
+
+  // Advertised list price ("was" / basis price)
+  // Amazon shows struck-through list price in .basisPrice or [data-a-strike="true"]
+  let advertisedListPrice = null;
+  const listPriceSelectors = [
+    '.basisPrice .a-offscreen',
+    '.basisPrice',
+    '.a-price[data-a-strike="true"] .a-offscreen',
+    '#priceblock_saleprice ~ .a-text-strike',
+    '#listPrice',
+    '.priceBlockStrikePriceString',
+  ];
+
+  for (const selector of listPriceSelectors) {
+    const el = document.querySelector(selector);
+    const text = el?.textContent?.trim() ?? el?.getAttribute('content');
+    if (text) {
+      const listResult = parsePrice(text, result.value.currency);
+      if (listResult.ok && listResult.value.amountMinor > result.value.amountMinor) {
+        advertisedListPrice = listResult.value;
+        break;
+      }
+    }
+  }
 
   return {
     title,
@@ -82,7 +105,9 @@ export function extractFromAmazon(document: Document): ExtractedProduct | null {
     imageUrl,
     currency: result.value.currency,
     inStock,
+    advertisedListPrice,
     confidence: 0.95,
     method: 'adapter',
+    stockState,
   };
 }

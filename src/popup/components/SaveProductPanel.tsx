@@ -1,7 +1,36 @@
 import React, { useState } from 'react';
-import type { ExtractedProduct } from '../../types/index.js';
+import type { ExtractedProduct, ExtractionMethod } from '../../types/index.js';
 import { formatMoney, parsePrice } from '../../lib/money.js';
 import { STRINGS } from '../../lib/strings.js';
+
+const METHOD_LABELS: Record<ExtractionMethod, string> = {
+  adapter: STRINGS.methodAdapter,
+  jsonld: STRINGS.methodJsonLd,
+  microdata: STRINGS.methodMicrodata,
+  opengraph: STRINGS.methodOpengraph,
+  shopify: STRINGS.methodShopify,
+  woocommerce: STRINGS.methodWoocommerce,
+  generic: STRINGS.methodGeneric,
+  manual: STRINGS.methodManual,
+};
+
+const GENERIC_METHODS: ExtractionMethod[] = ['generic'];
+
+function ExtractionLabel({ method }: { method: ExtractionMethod }) {
+  const isGeneric = GENERIC_METHODS.includes(method);
+  return (
+    <div className="mt-1 space-y-0.5">
+      <p className="text-xs text-gray-400">
+        Detected via {METHOD_LABELS[method]}
+      </p>
+      {isGeneric && (
+        <p className="text-xs text-amber-600 dark:text-amber-400">
+          ⚠ {STRINGS.methodTierWarning}
+        </p>
+      )}
+    </div>
+  );
+}
 
 interface SaveProductPanelProps {
   product: ExtractedProduct | null;
@@ -118,9 +147,7 @@ export function SaveProductPanel({
               <p className="text-lg font-bold text-gray-900 dark:text-white mt-1">
                 {formatMoney(product.price)}
               </p>
-              <p className="text-xs text-gray-400 mt-0.5">
-                Confidence: {Math.round(product.confidence * 100)}%
-              </p>
+              <ExtractionLabel method={product.method} />
             </div>
           </div>
         </div>

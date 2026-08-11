@@ -1,6 +1,7 @@
 import type { ExtractedProduct } from '../../../types/index.js';
 import { parsePrice } from '../../../lib/money.js';
 import { createLogger } from '../../../lib/logger.js';
+import { parseStockState, stockStateToInStock } from '../stockstate.js';
 
 const logger = createLogger('adapter:ebay');
 
@@ -52,8 +53,36 @@ export function extractFromEbay(document: Document): ExtractedProduct | null {
   const quantityEl = document.querySelector(
     '#qtySubTxt, .x-quantity__availability',
   );
-  const quantityText = quantityEl?.textContent?.trim()?.toLowerCase() ?? '';
-  const inStock = !quantityText.includes('sold') && !quantityText.includes('unavailable');
+  const quantityText = quantityEl?.textContent?.trim() ?? '';
+  const stockState = parseStockState(
+    quantityText.includes('sold') || quantityText.includes('unavailable')
+      ? 'out of stock'
+      : quantityText || 'in stock',
+  );
+  const inStock = stockStateToInStock(stockState);
+
+  // Advertised list price ("was" / original price)
+  // eBay shows struck-through original price in .ORIGINAL_PRICE or x-price-primary--strikethrough
+  let advertisedListPrice = null;
+  const listPriceSelectors = [
+    '.ORIGINAL_PRICE',
+    '[data-testid="x-price-primary--strikethrough"]',
+    '.x-price-was .ux-textspans',
+    '.x-price-original',
+    '.vi-price-np .notranslate',
+  ];
+
+  for (const selector of listPriceSelectors) {
+    const el = document.querySelector(selector);
+    const text = el?.getAttribute('content') ?? el?.textContent?.trim();
+    if (text) {
+      const listResult = parsePrice(text, result.value.currency);
+      if (listResult.ok && listResult.value.amountMinor > result.value.amountMinor) {
+        advertisedListPrice = listResult.value;
+        break;
+      }
+    }
+  }
 
   return {
     title,
@@ -61,7 +90,9 @@ export function extractFromEbay(document: Document): ExtractedProduct | null {
     imageUrl,
     currency: result.value.currency,
     inStock,
+    advertisedListPrice,
     confidence: 0.92,
     method: 'adapter',
+    stockState,
   };
 }

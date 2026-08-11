@@ -282,7 +282,10 @@ export function isAtPercentileLow(currentPrice: number, history: ObservationHist
     .filter((o) => o[0] * 60_000 >= cutoffMs)
     .map((o) => o[1])
     .sort((a, b) => a - b);
-  if (prices.length === 0) return false;
+  // Need at least 10 observations for the 10th-percentile to be meaningful.
+  // With fewer points the math degenerates: 1 observation always returns true
+  // because the single price IS the p10, causing false notifications on new products.
+  if (prices.length < 10) return false;
   const idx = Math.floor(0.10 * prices.length);
   const p10 = prices[idx] ?? prices[0];
   return currentPrice <= (p10 ?? Infinity);

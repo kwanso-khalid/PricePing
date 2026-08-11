@@ -297,9 +297,17 @@ describe('isAtPercentileLow', () => {
     expect(isAtPercentileLow(1000, makeHistory([]))).toBe(false);
   });
 
-  it('returns true when price is the single observation', () => {
+  it('returns false when fewer than 10 observations (insufficient data)', () => {
+    // Single observation — the price IS the p10, which caused false notifications.
+    // Requires minimum 10 observations to be meaningful.
     const obs: Observation[] = [makeObs(100, 1000)];
-    expect(isAtPercentileLow(1000, makeHistory(obs))).toBe(true);
+    expect(isAtPercentileLow(1000, makeHistory(obs))).toBe(false);
+  });
+
+  it('returns false with 9 observations even if price is the minimum', () => {
+    const obs: Observation[] = [];
+    for (let i = 0; i < 9; i++) obs.push(makeObs(1000 - i * 10, 1000 + i * 100));
+    expect(isAtPercentileLow(1000, makeHistory(obs))).toBe(false);
   });
 
   it('returns false for prices outside the 365-day window', () => {
